@@ -1,0 +1,8 @@
+.env
+__pycache__/
+test_audio/
+models/
+*.m4a
+*.wav
+*.log
+.DS_Store
