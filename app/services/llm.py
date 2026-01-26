@@ -14,42 +14,51 @@ def remove_thinking_tags(text: str) -> str:
     1. <think>...</think>
     2. <p>...思考内容...</p>...<h3>会议纪要</h3>
     3. HTML嵌套的各种变体
+    4. <p>语种：中文<br /></think></p> (跨行残留)
     """
     if not text:
         return text
     
     original_length = len(text)
     
-    # === 策略1: 移除标准 <think> 标签 ===
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # === 策略1: 移除标准 <think> 标签（包括跨行） ===
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
     
-    # === 策略2: 移除非标准格式 - 从开头到第一个 Markdown 标题之前的所有内容 ===
-    # 检测是否以 <p> 开头，且后面有 Markdown 标题（###、##、#）
-    match = re.search(r'^[\s\S]*?(?=#{1,3}\s)', text)
-    if match and match.group(0).strip().startswith('<p>'):
-        # 移除从开头到第一个标题之前的所有 HTML 段落（思考内容）
-        text = re.sub(r'^.*?(?=#{1,3}\s)', '', text, flags=re.DOTALL)
-        logger.info("🧹 检测到非标准思考格式，已移除开头的 HTML 段落")
+    # === 策略2: 移除残留的 </think> 标签及其所在的段落 ===
+    # 匹配包含 </think> 的整个 <p> 标签（包括跨行、包含 <br />）
+    text = re.sub(r'<p>[\s\S]*?</think>[\s\S]*?</p>', '', text, flags=re.IGNORECASE)
     
-    # === 策略3: 移除包含思考关键词的 <p> 段落 ===
-    # 常见思考关键词：好的、首先、接下来、需要注意、最后
-    thinking_keywords = [
-        r'<p>[\s\S]*?好的，我需要.*?</p>',
+    # === 策略3: 移除开头的思考内容 - 从开头到第一个 Markdown 标题 ===
+    # 检测是否以 <p> 或空白开头，且后面有 Markdown 标题（###、##、#）
+    if re.search(r'^[\s\S]*?#{1,3}\s', text):
+        # 查找第一个标题的位置
+        match = re.search(r'#{1,3}\s', text)
+        if match:
+            # 检查标题之前的内容是否包含思考关键词
+            before_title = text[:match.start()]
+            thinking_indicators = ['语种', '好的', '首先', '接下来', '需要', '思考', '<p>', '</think>']
+            if any(indicator in before_title for indicator in thinking_indicators):
+                text = text[match.start():]
+                logger.info("🧹 检测到开头的思考内容，已移除")
+    
+    # === 策略4: 移除包含思考关键词的 <p> 段落 ===
+    thinking_patterns = [
+        r'<p>[\s\S]*?语种[\s\S]*?</p>',  # 语种标识
+        r'<p>[\s\S]*?好的，我.*?</p>',
         r'<p>[\s\S]*?首先.*?</p>',
         r'<p>[\s\S]*?接下来.*?</p>',
         r'<p>[\s\S]*?需要注意.*?</p>',
-        r'<p>[\s\S]*?最后，需要确保.*?</p>',
-        r'<p>[\s\S]*?</think></p>',  # 残留的 </think> 标签
+        r'<p>[\s\S]*?最后，需要.*?</p>',
     ]
-    for pattern in thinking_keywords:
-        text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
+    for pattern in thinking_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
     
     # === 清理残留 ===
     # 移除空的 <p> 标签
-    text = re.sub(r'<p>\s*</p>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<p>\s*</p>', '', text)
     
-    # 移除开头的 <p> 和引号（如果还有残留）
-    text = re.sub(r'^[\s"]*<p>\s*', '', text)
+    # 移除开头的无用标签和空白
+    text = re.sub(r'^[\s"<>/\n]*', '', text)
     
     # 移除多余的空白行
     text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
@@ -61,6 +70,66 @@ def remove_thinking_tags(text: str) -> str:
     if removed_chars > 0:
         logger.info(f"🧹 已清理思考内容: 移除 {removed_chars} 字符")
     
+    return text
+
+
+def add_highlighting(text: str) -> str:
+    """
+    为会议纪要添加高亮标记
+    - 人名：用 <mark class="person">...</mark> 包裹
+    - 日期/时间：用 <mark class="date">...</mark> 包裹
+    - 存疑内容：用 <mark class="uncertain">...</mark> 包裹
+    
+    Args:
+        text: Markdown格式的会议纪要
+    
+    Returns:
+        添加了高亮标记的文本
+    """
+    if not text:
+        return text
+    
+    # === 1. 高亮人名（带引号的人名） ===
+    # 匹配中文引号、英文引号包裹的2-4个字的中文人名
+    text = re.sub(
+        r'[""]([一-龥]{2,4})[""]',
+        r'<mark class="person">\1</mark>',
+        text
+    )
+    
+    # === 2. 高亮日期和时间 ===
+    date_patterns = [
+        # 周X
+        (r'(周[一二三四五六日天])', r'<mark class="date">\1</mark>'),
+        # 今天、明天、后天、昨天
+        (r'(今天|明天|后天|昨天|前天)', r'<mark class="date">\1</mark>'),
+        # 本周、下周、上周
+        (r'(本周|下周|上周|这周|上上周)', r'<mark class="date">\1</mark>'),
+        # 本月、下月、上月
+        (r'(本月|下月|上月|这个月)', r'<mark class="date">\1</mark>'),
+        # X月X日
+        (r'(\d{1,2}月\d{1,2}日)', r'<mark class="date">\1</mark>'),
+        # YYYY-MM-DD、YYYY/MM/DD
+        (r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', r'<mark class="date">\1</mark>'),
+        # 时间点：如"周五"、"周二至周三"
+        (r'(周[一二三四五六日天]至周[一二三四五六日天])', r'<mark class="date">\1</mark>'),
+    ]
+    for pattern, replacement in date_patterns:
+        text = re.sub(pattern, replacement, text)
+    
+    # === 3. 高亮存疑内容 ===
+    uncertain_patterns = [
+        # "可能"、"大概"、"也许"、"似乎"、"应该"
+        (r'(可能|大概|也许|似乎|应该|估计|或许)', r'<mark class="uncertain">\1</mark>'),
+        # "待确认"、"待定"、"未确定"
+        (r'(待确认|待定|未确定|未明确|不确定)', r'<mark class="uncertain">\1</mark>'),
+        # "尚未"、"暂无"
+        (r'(尚未|暂无|暂时没有)', r'<mark class="uncertain">\1</mark>'),
+    ]
+    for pattern, replacement in uncertain_patterns:
+        text = re.sub(pattern, replacement, text)
+    
+    logger.info("✨ 已添加高亮标记（人名、日期、存疑内容）")
     return text
 
 class LLMService:
@@ -241,6 +310,9 @@ class LLMService:
             # 清理思考过程
             content = remove_thinking_tags(content)
             
+            # 添加高亮标记
+            content = add_highlighting(content)
+            
             usage = response.usage
             tokens = (usage.total_tokens if usage else 0)
             logger.info(f"✅ 生成完成，消耗 Token: {tokens}")
@@ -306,8 +378,13 @@ class LLMService:
             )
             
             content = response.choices[0].message.content
+            
             # 清理思考过程
             content = remove_thinking_tags(content)
+            
+            # 添加高亮标记
+            content = add_highlighting(content)
+            
             logger.info(f"✅ LLM 生成完成，长度: {len(content)}")
             return content
             

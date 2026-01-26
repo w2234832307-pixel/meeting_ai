@@ -16,7 +16,7 @@ import tempfile
 import shutil
 import gc
 import torch
-import highlighter
+# import highlighter  # 已移除：主服务不使用 html 字段
 
 # =============================================
 # 1. 日志配置 (存入 ./logs 目录)
@@ -148,10 +148,8 @@ async def transcribe(
             result = res[0]
             full_text = result.get("text", "")
 
-            # 高亮
-            if full_text:
-                logger.info("🎨 正在进行文本高亮处理...")
-                html_text = highlighter.process(full_text)
+            # 高亮功能已移除：主服务不使用 html 字段
+            html_text = full_text  # 暂时保持字段兼容性
             
             # 调试：打印返回的数据结构键
             logger.info(f"🔍 FunASR返回的数据字段: {list(result.keys())}")
