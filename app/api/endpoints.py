@@ -20,11 +20,14 @@ router = APIRouter()
 @router.post("/process", response_model=MeetingResponse)
 async def process_meeting_audio(
     # ========== 输入源参数 ==========
-    # 1. 音频文件流上传
-    file: Optional[UploadFile] = File(None), 
+    # 1. 音频文件流上传（单个或多个）
+    file: Optional[UploadFile] = File(None),  # 单个文件（向后兼容）
+    files: Optional[List[UploadFile]] = File(None),  # 多个文件（新增）
     
     # 2. 本地文件路径（用于测试或内部调用）
-    file_path: Optional[str] = Form(None),
+    file_path: Optional[str] = Form(None),  # 单个路径
+    file_paths: Optional[str] = Form(None, description="多个本地文件路径（逗号分隔）"),  # 多个路径（新增）
+    
     
     # 3. 音频URL（腾讯云ASR要求必须是可公网访问的URL）
     audio_url: Optional[str] = Form(None),
@@ -66,14 +69,97 @@ async def process_meeting_audio(
 ):
     """
     全能接口: 支持 音频 / 文档 / 纯文本 三大类输入
+    
+    ✨ 新功能：支持多音频合并处理
+    - 单个文件：file 或 file_path
+    - 多个文件：files 或 file_paths（逗号分隔）
     """
     temp_file_path = None  # 需要清理的临时文件路径
+    temp_files = []  # 多音频临时文件列表
     raw_text = ""
     transcript_data = []  # 逐字稿数据
 
     try:
-        # --- 情况 A: 处理音频 ---
-        if file or file_path or audio_id or audio_url:
+        # ========== 情况 A: 处理音频 ==========
+        # 检测是否为多音频模式
+        is_multi_audio = False
+        audio_paths = []
+        
+        # 判断1: 多个文件上传
+        if files and len(files) > 0:
+            is_multi_audio = True
+            for idx, upload_file in enumerate(files):
+                if upload_file.filename:
+                    temp_path = settings.TEMP_DIR / f"multi_{idx}_{upload_file.filename}"
+                    with open(temp_path, "wb") as buffer:
+                        shutil.copyfileobj(upload_file.file, buffer)
+                    audio_paths.append(str(temp_path))
+                    temp_files.append(temp_path)
+                    logger.info(f"💾 音频 [{idx+1}/{len(files)}] 已保存: {temp_path}")
+        
+        # 判断2: 多个文件路径（逗号分隔）
+        elif file_paths:
+            is_multi_audio = True
+            paths = [p.strip() for p in file_paths.split(',') if p.strip()]
+            for path in paths:
+                if not os.path.exists(path):
+                    return MeetingResponse(
+                        status="failed",
+                        message=f"文件不存在: {path}",
+                        transcript=[]
+                    )
+                audio_paths.append(path)
+            logger.info(f"📂 使用多个本地文件: 共 {len(audio_paths)} 个")
+        
+        # === 多音频处理分支 ===
+        if is_multi_audio and audio_paths:
+            logger.info(f"🎵 多音频模式: 共 {len(audio_paths)} 个音频文件")
+            
+            # 获取ASR服务
+            asr_service = get_asr_service(asr_model)
+            logger.info(f"🎤 使用ASR模型: {asr_model}")
+            
+            # 逐个识别并合并
+            current_speaker_offset = 0
+            
+            for idx, audio_path in enumerate(audio_paths):
+                logger.info(f"🎤 [{idx+1}/{len(audio_paths)}] 识别中: {os.path.basename(audio_path)}")
+                
+                asr_result = asr_service.transcribe(audio_path)
+                
+                if not asr_result or not asr_result.get("text"):
+                    logger.warning(f"⚠️ 音频 [{idx+1}] 识别结果为空，跳过")
+                    continue
+                
+                # 重新编号 speaker_id
+                transcript = asr_result.get("transcript", [])
+                if transcript:
+                    max_speaker_id = 0
+                    for item in transcript:
+                        if item.get("speaker_id"):
+                            original_id = item["speaker_id"]
+                            item["speaker_id"] = original_id + current_speaker_offset
+                            max_speaker_id = max(max_speaker_id, item["speaker_id"])
+                    
+                    if max_speaker_id > 0:
+                        current_speaker_offset = max_speaker_id
+                    
+                    transcript_data.extend(transcript)
+                    logger.info(f"✅ 音频 [{idx+1}] 识别成功: {len(transcript)} 条")
+            
+            if not transcript_data:
+                return MeetingResponse(
+                    status="failed",
+                    message="所有音频识别结果均为空",
+                    transcript=[]
+                )
+            
+            # 合并所有文本
+            raw_text = "\n".join([item.get("text", "") for item in transcript_data])
+            logger.info(f"📝 多音频合并完成: {len(audio_paths)} 个文件, 总长度 {len(raw_text)} 字")
+        
+        # === 单音频处理分支（原有逻辑） ===
+        elif file or file_path or audio_id or audio_url:
             # ✅ 使用print确保终端显示
             print(f"\n{'='*80}")
             print(f"📨 收到新的音频处理请求")
@@ -466,12 +552,22 @@ async def process_meeting_audio(
     
     finally:
         # 清理临时文件
+        # 1. 单文件清理
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.remove(temp_file_path)
                 logger.info(f"🧹 临时文件已清理: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"⚠️ 清理临时文件失败: {e}")
+        
+        # 2. 多文件清理
+        for temp_path in temp_files:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                    logger.info(f"🧹 临时文件已清理: {temp_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 清理临时文件失败: {temp_path}, {e}")
 
 @router.post("/archive", response_model=ArchiveResponse)
 async def archive_meeting_knowledge(request: ArchiveRequest):
@@ -589,214 +685,3 @@ async def register_employee_voice(
                 os.remove(temp_file_path)
             except:
                 pass
-
-
-@router.post("/process_multi_audio", response_model=MeetingResponse)
-async def process_multi_audio(
-    # ========== 多音频文件参数 ==========
-    files: List[UploadFile] = File(..., description="多个音频文件（按时间顺序上传）"),
-    file_paths: Optional[str] = Form(None, description="多个本地文件路径（用逗号分隔）"),
-    
-    # ========== 其他参数（同 /process 接口） ==========
-    template_id: str = Form("default"),
-    history_meeting_ids: Optional[str] = Form(None),
-    user_requirement: Optional[str] = Form(None),
-    history_mode: str = Form("auto"),
-    llm_model: str = Form("auto"),
-    llm_temperature: float = Form(0.7),
-    llm_max_tokens: int = Form(2000),
-    prompt_template: Optional[str] = Form(None),
-    asr_model: str = Form("auto"),
-):
-    """
-    多音频文件合并处理接口
-    
-    支持两种输入方式：
-    1. files: 上传多个音频文件（推荐）
-    2. file_paths: 提供多个本地文件路径（逗号分隔，用于测试）
-    
-    处理逻辑：
-    1. 按顺序识别每个音频文件
-    2. 合并所有识别结果（重新编号 speaker_id）
-    3. 生成统一的会议纪要
-    """
-    temp_files = []  # 临时文件列表
-    try:
-        logger.info(f"📨 收到多音频处理请求: 文件数量={len(files) if files else 0}")
-        
-        # ========== 步骤1: 获取所有音频文件路径 ==========
-        audio_paths = []
-        
-        # 方式1: 上传的文件流
-        if files and len(files) > 0:
-            for idx, file in enumerate(files):
-                if file.filename:
-                    temp_file_path = settings.TEMP_DIR / f"multi_upload_{idx}_{file.filename}"
-                    with open(temp_file_path, "wb") as buffer:
-                        shutil.copyfileobj(file.file, buffer)
-                    audio_paths.append(str(temp_file_path))
-                    temp_files.append(temp_file_path)
-                    logger.info(f"💾 音频流 [{idx+1}] 已保存: {temp_file_path}")
-        
-        # 方式2: 本地文件路径（逗号分隔）
-        elif file_paths:
-            paths = [p.strip() for p in file_paths.split(',') if p.strip()]
-            for path in paths:
-                if not os.path.exists(path):
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"文件不存在: {path}",
-                        transcript=[]
-                    )
-                audio_paths.append(path)
-            logger.info(f"📂 使用本地文件路径: 共 {len(audio_paths)} 个文件")
-        
-        if not audio_paths:
-            return MeetingResponse(
-                status="failed",
-                message="未提供任何音频文件",
-                transcript=[]
-            )
-        
-        # ========== 步骤2: 获取ASR服务 ==========
-        asr_service = get_asr_service(asr_model)
-        logger.info(f"🎤 使用ASR模型: {asr_model}")
-        
-        # ========== 步骤3: 逐个识别音频 ==========
-        all_transcripts = []  # 所有转录结果
-        current_speaker_offset = 0  # 当前说话人ID偏移量
-        
-        for idx, audio_path in enumerate(audio_paths):
-            logger.info(f"🎤 [{idx+1}/{len(audio_paths)}] 开始识别: {os.path.basename(audio_path)}")
-            
-            # 识别单个音频
-            asr_result = asr_service.transcribe(audio_path)
-            
-            if not asr_result or not asr_result.get("text"):
-                logger.warning(f"⚠️ 音频 [{idx+1}] 识别结果为空，跳过")
-                continue
-            
-            # 重新编号 speaker_id（避免不同音频的说话人ID冲突）
-            transcript = asr_result.get("transcript", [])
-            if transcript:
-                # 找出当前音频的最大 speaker_id
-                max_speaker_id = 0
-                for item in transcript:
-                    if item.get("speaker_id"):
-                        # 更新 speaker_id
-                        original_id = item["speaker_id"]
-                        item["speaker_id"] = original_id + current_speaker_offset
-                        max_speaker_id = max(max_speaker_id, item["speaker_id"])
-                
-                # 更新偏移量（下一个音频从这个ID开始）
-                if max_speaker_id > 0:
-                    current_speaker_offset = max_speaker_id
-                
-                all_transcripts.extend(transcript)
-                logger.info(f"✅ 音频 [{idx+1}] 识别成功: {len(transcript)} 条记录")
-        
-        if not all_transcripts:
-            return MeetingResponse(
-                status="failed",
-                message="所有音频识别结果均为空",
-                transcript=[]
-            )
-        
-        # ========== 步骤4: 合并所有文本 ==========
-        raw_text = "\n".join([item.get("text", "") for item in all_transcripts])
-        logger.info(f"📝 合并后的文本长度: {len(raw_text)} 字")
-        
-        # ========== 步骤5: 生成会议纪要 ==========
-        # 动态选择LLM模型
-        from app.services.llm_factory import get_llm_service_by_name
-        llm_service = get_llm_service_by_name(llm_model)
-        
-        # 处理历史会议（如果需要）
-        history_context = None
-        if history_meeting_ids:
-            meeting_ids = [mid.strip() for mid in history_meeting_ids.split(',') if mid.strip()]
-            if meeting_ids:
-                from app.services.meeting_history import meeting_history_service
-                
-                mode = meeting_history_service.determine_mode(
-                    meeting_ids=meeting_ids,
-                    user_requirement=user_requirement,
-                    history_mode=history_mode
-                )
-                
-                logger.info(f"📚 处理历史会议: {len(meeting_ids)} 个, 模式: {mode}")
-                
-                try:
-                    if mode == "retrieval":
-                        history_context = await meeting_history_service.process_by_retrieval(
-                            meeting_ids=meeting_ids,
-                            user_requirement=user_requirement,
-                            current_transcript=raw_text,
-                            llm_model=llm_model
-                        )
-                    else:
-                        history_context = await meeting_history_service.process_by_summary(
-                            meeting_ids=meeting_ids,
-                            user_requirement=user_requirement,
-                            llm_model=llm_model
-                        )
-                    logger.info(f"✅ 历史会议处理完成: {mode} 模式")
-                except Exception as e:
-                    logger.error(f"❌ 历史会议处理失败: {e}")
-                    history_context = None
-        
-        # 动态模板渲染
-        from app.services.prompt_template import prompt_template_service
-        
-        template_config = prompt_template_service.get_template_config(
-            prompt_template=prompt_template,
-            template_id=template_id
-        )
-        
-        final_prompt = prompt_template_service.render_prompt(
-            template_config=template_config,
-            current_transcript=raw_text,
-            history_context=history_context,
-            user_requirement=user_requirement
-        )
-        
-        logger.info(f"📝 提示词渲染完成，长度: {len(final_prompt)}")
-        
-        # 调用LLM生成
-        if hasattr(llm_service, 'chat'):
-            final_markdown = llm_service.chat(final_prompt)
-        else:
-            # 降级处理
-            final_markdown = llm_service.generate_markdown(
-                raw_text=raw_text,
-                context=history_context or "",
-                template_id=template_id,
-                custom_instruction=user_requirement
-            )
-        
-        # ========== 步骤6: 返回结果 ==========
-        return MeetingResponse(
-            status="success",
-            message=f"多音频处理成功（共 {len(audio_paths)} 个文件）",
-            transcript=[TranscriptItem(**item) for item in all_transcripts],
-            markdown=final_markdown,
-            html=markdown.markdown(final_markdown, extensions=['tables', 'fenced_code'])
-        )
-    
-    except Exception as e:
-        logger.error(f"❌ 多音频处理异常: {e}", exc_info=True)
-        return MeetingResponse(
-            status="failed",
-            message=f"处理失败: {str(e)}",
-            transcript=[]
-        )
-    
-    finally:
-        # 清理临时文件
-        for temp_file in temp_files:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                    logger.info(f"🗑️ 已清理临时文件: {temp_file}")
-                except Exception as e:
-                    logger.warning(f"⚠️ 清理临时文件失败: {temp_file}, 错误: {e}")

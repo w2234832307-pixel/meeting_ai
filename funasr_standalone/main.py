@@ -16,6 +16,7 @@ import tempfile
 import shutil
 import gc
 import torch
+import highlighter
 
 # =============================================
 # 1. 日志配置 (存入 ./logs 目录)
@@ -53,8 +54,13 @@ try:
     from funasr import AutoModel
     logger.info("📦 正在初始化服务...")
     
-    # 显式指定 CPU
-    DEVICE = "cpu"
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+        logger.info("✅ 检测到可用 GPU，使用 CUDA 加速")
+    else:
+        DEVICE = "cpu"
+        logger.info("⚠️ 未检测到 GPU，使用 CPU 模式")
+        
     # 增加线程数以利用服务器的 16核 CPU
     NCPU = 8 
     
@@ -136,11 +142,16 @@ async def transcribe(
         
         # 3. 结果解析（包含时间戳和说话人ID）
         full_text = ""
+        html_text = ""
         transcript = []
-        
         if res and len(res) > 0:
             result = res[0]
             full_text = result.get("text", "")
+
+            # 高亮
+            if full_text:
+                logger.info("🎨 正在进行文本高亮处理...")
+                html_text = highlighter.process(full_text)
             
             # 调试：打印返回的数据结构键
             logger.info(f"🔍 FunASR返回的数据字段: {list(result.keys())}")
@@ -250,8 +261,10 @@ async def transcribe(
             "code": 0,
             "msg": "success",
             "text": full_text,
+            "html": html_text,
             "data": {
                 "text": full_text,
+                "html": html_text,
                 "transcript": transcript
             }
         }
