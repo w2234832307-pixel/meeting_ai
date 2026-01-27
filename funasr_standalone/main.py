@@ -71,14 +71,10 @@ try:
     
     # ✅ 升级到大模型 + 完整配置
     model = AutoModel(
-        # ⭐ 使用Paraformer-Large大模型（准确率提升5-8%）
-        model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        # ⭐ 使用Paraformer-Large大模型（带VAD和标点，支持时间戳和说话人分离）
+        model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
         model_revision="v2.0.4",
-        # VAD模型（语音活动检测）
-        vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-        # 标点模型
-        punc_model="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
-        # 说话人识别模型
+        # 说话人识别模型（Cam++）
         spk_model="iic/speech_campplus_sv_zh-cn_16k-common",
         device=DEVICE,
         ncpu=NCPU,
@@ -111,8 +107,6 @@ async def transcribe(
     file: UploadFile = File(None), 
     # 2. url 参数
     audio_url: str = Form(None),   
-    enable_vad: bool = Form(True),
-    enable_punc: bool = Form(True),
     hotword: str = Form("")  # 外部传入的热词（可选）
 ):
     temp_file_path = None
@@ -163,21 +157,13 @@ async def transcribe(
             combined_hotwords = hotword
         
         # === 开始推理 ===
-        logger.info(f"Processing... VAD:{enable_vad} | Punc:{enable_punc} | Hotword:{len(combined_hotwords)} chars")
+        logger.info(f"Processing... Hotword:{len(combined_hotwords)} chars")
 
         res = model.generate(
             input=input_data, 
             batch_size_s=300, 
             hotword=combined_hotwords,  # ✅ 使用合并后的热词
-            use_vad=enable_vad,
-            use_punc=enable_punc,
-            sentence_timestamp=True,
-            # ✅ 优化VAD参数（提升准确率2-3%）
-            vad_kwargs={
-                "max_single_segment_time": 15000,      # 单段最长15秒（提高分段准确性）
-                "speech_noise_thres": 0.9,             # 提高噪音阈值（减少噪音误识别）
-                "vad_tol": 500                         # VAD容忍度500ms
-            }
+            sentence_timestamp=True     # ✅ 启用时间戳（支持说话人分离）
         )
         
         # 3. 结果解析（包含时间戳和说话人ID）
