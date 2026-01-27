@@ -13,12 +13,13 @@ logger = logging.getLogger(__name__)
 class HotwordService:
     """热词管理服务"""
     
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, auto_reload: bool = True):
         """
         初始化热词服务
         
         Args:
             config_path: 热词配置文件路径（相对于funasr_standalone目录）
+            auto_reload: 是否自动检测文件变化并重新加载（默认True）
         """
         if config_path is None:
             # 默认使用 funasr_standalone/hotwords.json
@@ -26,14 +27,27 @@ class HotwordService:
         
         self.config_path = Path(config_path)
         self.hotwords_cache: Dict[str, List[str]] = {}
+        self.auto_reload = auto_reload  # 自动重载开关
+        self.last_mtime = 0  # 文件最后修改时间
         self._load_hotwords()
     
-    def _load_hotwords(self) -> None:
-        """从配置文件加载热词"""
+    def _load_hotwords(self, force: bool = False) -> None:
+        """
+        从配置文件加载热词
+        
+        Args:
+            force: 是否强制重新加载（不检查文件时间）
+        """
         try:
             if not self.config_path.exists():
                 logger.warning(f"⚠️ 热词配置文件不存在: {self.config_path}，将创建默认配置")
                 self._create_default_config()
+                return
+            
+            # 检查文件修改时间
+            current_mtime = self.config_path.stat().st_mtime
+            if not force and current_mtime == self.last_mtime:
+                # 文件未修改，跳过加载
                 return
             
             with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -45,12 +59,19 @@ class HotwordService:
                 if isinstance(v, list) and k not in ["说明", "description", "备注"]
             }
             
-            total_count = sum(len(v) for v in self.hotwords_cache.values())
-            logger.info(f"✅ 成功加载热词配置: {len(self.hotwords_cache)} 个类别, 共 {total_count} 个词")
+            # 更新文件修改时间
+            self.last_mtime = current_mtime
             
-            # 打印各类别数量
-            for category, words in self.hotwords_cache.items():
-                logger.info(f"  - {category}: {len(words)} 个")
+            total_count = sum(len(v) for v in self.hotwords_cache.values())
+            
+            # 只在文件真正变化时打印详细日志
+            if force or self.last_mtime != 0:
+                logger.info(f"🔄 热词已更新: {len(self.hotwords_cache)} 个类别, 共 {total_count} 个词")
+                # 打印各类别数量
+                for category, words in self.hotwords_cache.items():
+                    logger.info(f"  - {category}: {len(words)} 个")
+            else:
+                logger.info(f"✅ 成功加载热词配置: {len(self.hotwords_cache)} 个类别, 共 {total_count} 个词")
                 
         except json.JSONDecodeError as e:
             logger.error(f"❌ 热词配置文件格式错误: {e}")
@@ -113,6 +134,10 @@ class HotwordService:
         Returns:
             热词字符串，如："张三 李四 智能办公 数据中台"
         """
+        # 自动检测文件变化并重新加载
+        if self.auto_reload:
+            self._load_hotwords()
+        
         return separator.join(self.get_all_hotwords())
     
     def reload(self) -> bool:
