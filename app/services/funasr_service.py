@@ -112,6 +112,8 @@ class FunASRService:
             # 发送请求到独立服务
             url = f"{self.service_url}/transcribe"
             
+            # 注意：热词现在由FunASR服务自动管理，无需在这里传递
+            
             with open(file_path_obj, "rb") as f:
                 files = {"file": (file_path_obj.name, f, "audio/mpeg")}
                 data = {
@@ -123,7 +125,7 @@ class FunASRService:
                     url,
                     files=files,
                     data=data,
-                    timeout=getattr(settings, "ASR_TIMEOUT", 300)
+                    timeout=getattr(settings, "ASR_TIMEOUT", 600)
                 )
             
             if response.status_code != 200:
@@ -163,7 +165,7 @@ class FunASRService:
             if not file_path_obj.exists():
                 raise ASRServiceException(f"音频文件不存在: {file_path}")
             
-            # 调用本地模型
+            # 调用本地模型（如果需要热词，应该在funasr_standalone服务中配置）
             res = self.model.generate(
                 input=str(file_path_obj),
                 batch_size_s=300,

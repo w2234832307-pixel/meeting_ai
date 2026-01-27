@@ -685,3 +685,68 @@ async def register_employee_voice(
                 os.remove(temp_file_path)
             except:
                 pass
+
+
+# =============================================
+# 热词管理接口
+# =============================================
+
+@router.get("/api/hotwords")
+async def get_hotwords():
+    """
+    【获取热词列表】
+    转发到FunASR服务获取热词
+    """
+    try:
+        import requests
+        from app.core.config import settings
+        
+        # 构建FunASR服务URL
+        funasr_url = getattr(settings, "FUNASR_SERVICE_URL", "http://localhost:8002")
+        response = requests.get(f"{funasr_url}/hotwords", timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "code": 200,
+                "message": "获取成功",
+                "data": data.get("data", {})
+            }
+        else:
+            return {"code": 500, "message": "FunASR服务返回错误"}
+            
+    except Exception as e:
+        logger.error(f"❌ 获取热词失败: {e}")
+        return {"code": 500, "message": f"获取失败: {str(e)}"}
+
+
+@router.post("/api/hotwords/reload")
+async def reload_hotwords():
+    """
+    【重新加载热词】
+    转发到FunASR服务重新加载热词（用于修改funasr_standalone/hotwords.json后刷新）
+    """
+    try:
+        import requests
+        from app.core.config import settings
+        
+        # 构建FunASR服务URL
+        funasr_url = getattr(settings, "FUNASR_SERVICE_URL", "http://localhost:8002")
+        response = requests.post(f"{funasr_url}/hotwords/reload", timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("code") == 0:
+                return {
+                    "code": 200,
+                    "message": "热词重载成功",
+                    "data": data.get("data", {})
+                }
+            else:
+                return {"code": 500, "message": data.get("msg", "重载失败")}
+        else:
+            return {"code": 500, "message": "FunASR服务返回错误"}
+            
+    except Exception as e:
+        logger.error(f"❌ 重载热词失败: {e}")
+        return {"code": 500, "message": f"重载失败: {str(e)}"}

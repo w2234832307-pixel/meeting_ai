@@ -79,6 +79,7 @@ def add_highlighting(text: str) -> str:
     - 人名：用 <mark class="person">...</mark> 包裹
     - 日期/时间：用 <mark class="date">...</mark> 包裹
     - 存疑内容：用 <mark class="uncertain">...</mark> 包裹
+    - 项目名：用 <mark class="project">...</mark> 包裹
     
     Args:
         text: Markdown格式的会议纪要
@@ -89,15 +90,43 @@ def add_highlighting(text: str) -> str:
     if not text:
         return text
     
-    # === 1. 高亮人名（带引号的人名） ===
-    # 匹配中文引号、英文引号包裹的2-4个字的中文人名
+    # === 1. 高亮人名 ===
+    # 1.1 带引号的人名：匹配中文引号、英文引号包裹的1-4个字的中文人名
     text = re.sub(
-        r'[""]([一-龥]{2,4})[""]',
+        r'[""]([一-龥]{1,4})[""]',
         r'<mark class="person">\1</mark>',
         text
     )
     
-    # === 2. 高亮日期和时间 ===
+    # 1.2 <strong> 标签中的人名（LLM常用格式）
+    # 匹配 <strong>唐玉</strong>、<strong>子波</strong>、<strong>李</strong> 等格式
+    # 扩展到1-10个字，支持复姓和更长的名字
+    text = re.sub(
+        r'<strong>([一-龥]{1,10})</strong>',
+        r'<mark class="person">\1</mark>',
+        text
+    )
+    
+    # 1.3 **Markdown加粗**中的人名
+    # 匹配 **唐玉**、**子波**、**李** 等格式
+    text = re.sub(
+        r'\*\*([一-龥]{1,10})\*\*',
+        r'<mark class="person">\1</mark>',
+        text
+    )
+    
+    # === 2. 高亮项目名/产品名 ===
+    # 通用项目名模式（不依赖特定名称）
+    project_patterns = [
+        # 大写字母项目名：OMC、ONC、FSU、AI等（2-10个连续大写字母）
+        (r'\b([A-Z]{2,10})\b', r'<mark class="project">\1</mark>'),
+        # 带"项目"、"产品"、"系统"、"平台"、"工具"、"服务"后缀的名称
+        (r'([一-龥0-9A-Za-z]{2,15}(?:项目|产品|系统|平台|工具|服务|计划|方案|库))', r'<mark class="project">\1</mark>'),
+    ]
+    for pattern, replacement in project_patterns:
+        text = re.sub(pattern, replacement, text)
+    
+    # === 3. 高亮日期和时间 ===
     date_patterns = [
         # 周X
         (r'(周[一二三四五六日天])', r'<mark class="date">\1</mark>'),
@@ -117,19 +146,18 @@ def add_highlighting(text: str) -> str:
     for pattern, replacement in date_patterns:
         text = re.sub(pattern, replacement, text)
     
-    # === 3. 高亮存疑内容 ===
+    # === 4. 高亮存疑内容（基于ASR低置信度标记）===
+    # 注意：这里高亮的是LLM已经标记为【存疑】的内容
+    # 如果ASR识别有低置信度，会用特殊标记包裹，如：【存疑：某个词】
     uncertain_patterns = [
-        # "可能"、"大概"、"也许"、"似乎"、"应该"
-        (r'(可能|大概|也许|似乎|应该|估计|或许)', r'<mark class="uncertain">\1</mark>'),
-        # "待确认"、"待定"、"未确定"
-        (r'(待确认|待定|未确定|未明确|不确定)', r'<mark class="uncertain">\1</mark>'),
-        # "尚未"、"暂无"
-        (r'(尚未|暂无|暂时没有)', r'<mark class="uncertain">\1</mark>'),
+        # ASR低置信度标记（由LLM生成的存疑标记）
+        (r'【存疑[：:]\s*([^】]+)】', r'<mark class="uncertain">\1</mark>'),
+        (r'\[存疑[：:]\s*([^\]]+)\]', r'<mark class="uncertain">\1</mark>'),
     ]
     for pattern, replacement in uncertain_patterns:
         text = re.sub(pattern, replacement, text)
     
-    logger.info("✨ 已添加高亮标记（人名、日期、存疑内容）")
+    logger.info("✨ 已添加高亮标记（人名、项目名、日期、ASR存疑内容）")
     return text
 
 class LLMService:
