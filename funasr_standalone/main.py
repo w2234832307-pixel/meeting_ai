@@ -18,7 +18,8 @@ import gc
 import torch
 from hotword_service import get_hotword_service  # ✅ 导入热词服务
 from audio_preprocessor import audio_preprocessor  # ✅ 导入音频预处理
-from voice_matcher import get_voice_matcher  # ✅ 导入声纹匹配
+# 声纹匹配延迟加载，避免启动时的依赖错误
+# from voice_matcher import get_voice_matcher
 
 # =============================================
 # 1. 日志配置 (存入 ./logs 目录)
@@ -304,7 +305,11 @@ async def transcribe(
         logger.info(f"✅ 识别成功: {file.filename} (长度: {len(full_text)}字)")
         
         # ===== 声纹识别（可选，如果声纹库为空则跳过）=====
+        matched_info = {}
         try:
+            # 延迟导入，避免启动时的依赖错误
+            from voice_matcher import get_voice_matcher
+            
             voice_matcher = get_voice_matcher()
             if voice_matcher and voice_matcher.enabled and transcript and temp_file_path:
                 logger.info("🎙️ 开始声纹匹配...")
@@ -353,6 +358,10 @@ async def transcribe(
                 elif not voice_matcher.enabled:
                     logger.info("ℹ️ 声纹库为空，跳过声纹匹配")
                     
+        except ImportError as e:
+            logger.warning(f"⚠️ 声纹匹配模块导入失败（依赖缺失），跳过声纹匹配")
+            logger.warning(f"   如需使用声纹识别，请运行: pip install 'datasets>=2.14.0'")
+            matched_info = {}
         except Exception as e:
             logger.error(f"❌ 声纹匹配失败: {e}", exc_info=True)
             matched_info = {}
