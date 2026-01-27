@@ -69,18 +69,31 @@ try:
     
     logger.info(f"⚙️ 加载模型中... (Device: {DEVICE}, Threads: {NCPU})")
     
-    # ✅ 升级到大模型 + 完整配置
+    # =================== 配置1：小模型（推荐，显存占用小）===================
+    # ✅ 使用标准Paraformer模型（显存占用约4-6GB）
     model = AutoModel(
-        # ⭐ 使用Paraformer-Large大模型（带VAD和标点，支持时间戳和说话人分离）
-        model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-        model_revision="v2.0.4",
-        # 说话人识别模型（Cam++）
-        spk_model="iic/speech_campplus_sv_zh-cn_16k-common",
+        model="paraformer-zh",                          # 标准中文模型
+        vad_model="fsmn-vad",                          # VAD模型
+        punc_model="ct-punc",                          # 标点模型
+        spk_model="cam++",                             # 说话人识别
         device=DEVICE,
         ncpu=NCPU,
         disable_update=True,
-        quantize=False  
+        quantize=False
     )
+    
+    # =================== 配置2：大模型（注释，需要12GB+显存）===================
+    # # ⭐ Paraformer-Large大模型（带VAD和标点，支持完整时间戳和说话人分离）
+    # # 显存需求：12-16GB，准确率最高，功能最完整
+    # model = AutoModel(
+    #     model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+    #     model_revision="v2.0.4",
+    #     spk_model="iic/speech_campplus_sv_zh-cn_16k-common",
+    #     device=DEVICE,
+    #     ncpu=NCPU,
+    #     disable_update=True,
+    #     quantize=False
+    # )
     
     logger.info("✅ FunASR 模型加载成功！服务就绪。")
     
@@ -163,7 +176,8 @@ async def transcribe(
             input=input_data, 
             batch_size_s=300, 
             hotword=combined_hotwords,  # ✅ 使用合并后的热词
-            sentence_timestamp=True     # ✅ 启用时间戳（支持说话人分离）
+            batch_size_token=5000,      # token批处理大小
+            batch_size_token_threshold_s=60  # 时间阈值
         )
         
         # 3. 结果解析（包含时间戳和说话人ID）
