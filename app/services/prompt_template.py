@@ -238,35 +238,214 @@ class PromptTemplateService:
             
         except json.JSONDecodeError as e:
             logger.error(f"❌ 模板JSON解析失败: {e}")
+            logger.error(f"   尝试解析的内容（前100字符）: {template_str[:100]}")
+            logger.error(f"   💡 提示：如果内容包含反斜杠，请使用双反斜杠（\\\\）或正斜杠（/）")
             return None
     
     @staticmethod
     def get_template_config(
         prompt_template: Optional[str] = None,
-        template_id: str = "default"
+        template_id: str = "default",
+        strict: bool = False
     ) -> Dict[str, Any]:
         """
         获取模板配置（优先使用自定义模板）
         
         Args:
-            prompt_template: 自定义模板JSON字符串
-            template_id: 默认模板ID
+            prompt_template: 自定义模板（JSON字符串或文档路径）
+            template_id: 默认模板ID（或文档路径）
+            strict: 严格模式，如果自定义模板解析失败则抛出异常
         
         Returns:
             模板配置字典
+        
+        Raises:
+            ValueError: 严格模式下，自定义模板解析失败时抛出
         """
         # 1. 优先使用自定义模板
-        if prompt_template:
-            custom_config = PromptTemplateService.parse_template_from_string(
-                prompt_template
-            )
-            if custom_config:
-                logger.info("📝 使用自定义模板")
-                return custom_config
+        if prompt_template and prompt_template.strip():
+            # 清理可能的干扰字符
+            cleaned = prompt_template.strip().strip('"').strip("'")
+            
+            # ⭐ 检查是否是文档路径（支持 .docx, .pdf, .txt）
+            if cleaned.lower().endswith(('.docx', '.pdf', '.txt')):
+                logger.info(f"📂 检测到模板文档路径: {cleaned}")
+                
+                # 尝试读取文档内容
+                import os
+                if os.path.exists(cleaned):
+                    try:
+                        from app.services.document import document_service
+                        template_content = document_service.extract_text_from_file(cleaned)
+                        
+                        if template_content and template_content.strip():
+                            logger.info(f"✅ 成功读取模板文档，长度: {len(template_content)}")
+                            
+                            # ⭐ 智能检测：是否包含占位符（说明是格式模板而非提示词）
+                            is_format_template = any([
+                                '[请填写' in template_content,
+                                '[例如：' in template_content,
+                                'XXXX' in template_content,
+                                '[填写' in template_content,
+                                '【请填写' in template_content,
+                            ])
+                            
+                            if is_format_template:
+                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求")
+                                # 构建一个智能提示词，让 LLM 根据转录内容填充模板
+                                smart_prompt = f"""你是一位专业的会议纪要整理助手。
+
+## 任务说明
+请根据以下**会议录音转录内容**，严格按照**指定格式模板**生成会议纪要。
+
+## 重要要求
+1. **必须根据实际会议内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`）
+2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容**
+3. 如果会议中没有提及某项内容，填写"未讨论"或"无"，不要留空或保留占位符
+4. 时间格式使用实际时间（从转录内容推断或使用当前时间）
+5. 人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记
+6. 存疑内容使用 `<mark class="uncertain">` 标记
+
+## 指定格式模板
+{template_content}
+
+## 会议录音转录内容
+{{{{current_transcript}}}}
+
+## 历史会议背景（如有）
+{{{{history_context}}}}
+
+## 用户特殊要求（如有）
+{{{{user_requirement}}}}
+
+请严格按照上述格式模板生成完整的会议纪要，确保所有占位符都被实际内容替换！"""
+                                
+                                return {
+                                    "template_id": "custom_format_template",
+                                    "template_name": f"格式模板: {os.path.basename(cleaned)}",
+                                    "prompt_template": smart_prompt,
+                                    "variables": {},
+                                    "dynamic_sections": {}
+                                }
+                            else:
+                                logger.info("📝 检测到提示词模板（无占位符），直接使用")
+                                # 直接作为提示词使用
+                                return {
+                                    "template_id": "custom_from_doc",
+                                    "template_name": f"文档模板: {os.path.basename(cleaned)}",
+                                    "prompt_template": template_content,
+                                    "variables": {},
+                                    "dynamic_sections": {}
+                                }
+                        else:
+                            logger.error(f"❌ 模板文档内容为空: {cleaned}")
+                    except Exception as e:
+                        logger.error(f"❌ 读取模板文档失败: {e}")
+                else:
+                    logger.error(f"❌ 模板文档不存在: {cleaned}")
+                
+                # 文档读取失败，降级
+                logger.warning("⚠️ 文档模板读取失败，降级使用默认模板")
+            
+            # 检查是否是JSON格式
+            elif cleaned.startswith('{') and cleaned.endswith('}'):
+                custom_config = PromptTemplateService.parse_template_from_string(cleaned)
+                if custom_config:
+                    logger.info("📝 使用自定义JSON模板")
+                    return custom_config
+                else:
+                    error_msg = "自定义模板JSON解析失败，请检查JSON格式是否正确"
+                    logger.error(f"❌ {error_msg}")
+                    if strict:
+                        raise ValueError(error_msg)
+                    logger.warning("⚠️ 降级使用默认模板")
             else:
-                logger.warning("⚠️ 自定义模板解析失败，使用默认模板")
+                # 既不是文档路径，也不是JSON，可能是纯文本模板
+                logger.info("📝 使用纯文本自定义模板")
+                return {
+                    "template_id": "custom_plain",
+                    "template_name": "纯文本自定义模板",
+                    "prompt_template": cleaned,
+                    "variables": {},
+                    "dynamic_sections": {}
+                }
         
-        # 2. 使用默认模板
+        # 2. 使用 template_id（也可能是文档路径）
+        # 检查 template_id 是否是文档路径
+        if template_id and template_id.strip():
+            cleaned_tid = template_id.strip().strip('"').strip("'")
+            
+            if cleaned_tid.lower().endswith(('.docx', '.pdf', '.txt')):
+                logger.info(f"📂 检测到template_id是文档路径: {cleaned_tid}")
+                
+                import os
+                if os.path.exists(cleaned_tid):
+                    try:
+                        from app.services.document import document_service
+                        template_content = document_service.extract_text_from_file(cleaned_tid)
+                        
+                        if template_content and template_content.strip():
+                            logger.info(f"✅ 成功读取模板文档，长度: {len(template_content)}")
+                            
+                            # ⭐ 智能检测：是否包含占位符（说明是格式模板而非提示词）
+                            is_format_template = any([
+                                '[请填写' in template_content,
+                                '[例如：' in template_content,
+                                'XXXX' in template_content,
+                                '[填写' in template_content,
+                                '【请填写' in template_content,
+                            ])
+                            
+                            if is_format_template:
+                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求")
+                                # 构建一个智能提示词，让 LLM 根据转录内容填充模板
+                                smart_prompt = f"""你是一位专业的会议纪要整理助手。
+
+## 任务说明
+请根据以下**会议录音转录内容**，严格按照**指定格式模板**生成会议纪要。
+
+## 重要要求
+1. **必须根据实际会议内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`）
+2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容**
+3. 如果会议中没有提及某项内容，填写"未讨论"或"无"，不要留空或保留占位符
+4. 时间格式使用实际时间（从转录内容推断或使用当前时间）
+5. 人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记
+6. 存疑内容使用 `<mark class="uncertain">` 标记
+
+## 指定格式模板
+{template_content}
+
+## 会议录音转录内容
+{{{{current_transcript}}}}
+
+## 历史会议背景（如有）
+{{{{history_context}}}}
+
+## 用户特殊要求（如有）
+{{{{user_requirement}}}}
+
+请严格按照上述格式模板生成完整的会议纪要，确保所有占位符都被实际内容替换！"""
+                                
+                                return {
+                                    "template_id": "custom_format_template",
+                                    "template_name": f"格式模板: {os.path.basename(cleaned_tid)}",
+                                    "prompt_template": smart_prompt,
+                                    "variables": {},
+                                    "dynamic_sections": {}
+                                }
+                            else:
+                                logger.info("📝 检测到提示词模板（无占位符），直接使用")
+                                return {
+                                    "template_id": "custom_from_doc",
+                                    "template_name": f"文档模板: {os.path.basename(cleaned_tid)}",
+                                    "prompt_template": template_content,
+                                    "variables": {},
+                                    "dynamic_sections": {}
+                                }
+                    except Exception as e:
+                        logger.error(f"❌ 读取模板文档失败: {e}")
+        
+        # 3. 使用默认模板
         template_config = get_default_template(template_id)
         logger.info(f"📝 使用默认模板: {template_id}")
         return template_config

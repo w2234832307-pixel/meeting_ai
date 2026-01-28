@@ -333,39 +333,10 @@ async def process_meeting_audio(
             )
 
         # ---------------------------------------------------------
-        # 2. 【核心修复】解析模板内容 (如果是本地文件路径)
+        # 2. 模板处理（已移到 prompt_template_service 中统一处理）
         # ---------------------------------------------------------
-        real_template_content = template_id  # 默认值
-        
-        # 🧹 第一步：清洗路径 (去除可能存在的引号和空格)
-        if template_id:
-            clean_path = template_id.strip().strip('"').strip("'")
-        else:
-            clean_path = ""
-
-        # 🖨️ 强制打印调试信息 (请关注控制台输出)
-        if clean_path and ".docx" in clean_path:
-            logger.info(f"🔍 [调试] 正在检查路径: [{clean_path}]")
-            logger.info(f"🔍 [调试] 文件是否存在: {os.path.exists(clean_path)}")
-
-        # 📂 第二步：判断并读取
-        if clean_path and len(clean_path) > 3 and clean_path.lower().endswith(('.docx', '.pdf', '.txt')):
-            if os.path.exists(clean_path):
-                logger.info(f"📂 检测到本地模板文件: {clean_path}，正在读取...")
-                
-                # 调用 DocumentService 读取模板文件
-                extracted_template = document_service.extract_text_from_file(clean_path)
-                
-                if extracted_template:
-                    # ★★★ 关键点：这里把路径换成了真实内容 ★★★
-                    real_template_content = extracted_template
-                    logger.info(f"✅ 成功读取本地模板内容，字数: {len(real_template_content)}")
-                    # 打印前50个字看看是不是真的读到了
-                    logger.info(f"📝 模板预览: {real_template_content[:50]}...")
-                else:
-                    logger.warning(f"⚠️ 模板文件读取为空")
-            else:
-                logger.warning(f"⚠️ 路径看起来像文件，但系统找不到: {clean_path}")
+        # 现在 prompt_template_service.get_template_config 已经支持文档路径
+        # 所以这里不需要额外处理了
 
         # ---------------------------------------------------------
         # 历史会议处理部分（新增）⭐
@@ -453,10 +424,11 @@ async def process_meeting_audio(
         # 1. 使用动态模板渲染（新增）⭐
         from app.services.prompt_template import prompt_template_service
         
-        # 获取模板配置（优先使用自定义模板）
+        # 获取模板配置（优先使用 prompt_template，其次是 template_id）
+        # 现在两个参数都支持文档路径、JSON字符串或纯文本
         template_config = prompt_template_service.get_template_config(
             prompt_template=prompt_template,
-            template_id=template_id if not real_template_content or real_template_content == template_id else "default"
+            template_id=template_id
         )
         
         # 渲染最终的提示词
@@ -493,11 +465,14 @@ async def process_meeting_audio(
                     else:
                         logger.warning("⚠️ 向量服务不可用，跳过历史检索")
 
-                # 生成
+                # 生成（使用模板配置中的模板内容或template_id）
+                # 如果模板配置包含 prompt_template，使用它；否则使用 template_id
+                template_to_use = template_config.get("prompt_template", template_id)
+                
                 structured_data = llm_service.generate_markdown(
                     raw_text=raw_text, 
                     context=context_info,
-                    template_id=real_template_content,
+                    template_id=template_to_use,
                     custom_instruction=final_user_requirement
                 )
         except Exception as e:

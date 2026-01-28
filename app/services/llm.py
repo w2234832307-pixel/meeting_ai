@@ -75,89 +75,67 @@ def remove_thinking_tags(text: str) -> str:
 
 def add_highlighting(text: str) -> str:
     """
-    为会议纪要添加高亮标记
-    - 人名：用 <mark class="person">...</mark> 包裹
-    - 日期/时间：用 <mark class="date">...</mark> 包裹
-    - 存疑内容：用 <mark class="uncertain">...</mark> 包裹
-    - 项目名：用 <mark class="project">...</mark> 包裹
-    
-    Args:
-        text: Markdown格式的会议纪要
-    
-    Returns:
-        添加了高亮标记的文本
+    增强版高亮函数
     """
     if not text:
         return text
+
+    # 定义样式
+    STYLES = {
+        "person": 'style="background-color: #dbeafe; color: #1e40af; padding: 0 2px; border-radius: 3px;"',
+        "date": 'style="background-color: #dcfce7; color: #166534; padding: 0 2px; border-radius: 3px;"',
+        "uncertain": 'style="background-color: #fee2e2; color: #991b1b; text-decoration: underline dashed;"',
+        "project": 'style="background-color: #f3e8ff; color: #6b21a8; font-weight: 500;"'
+    }
+
+    # === 1. 人名优化 ===
+    # 1.1 匹配 Markdown 加粗/Strong/引号 (保留原逻辑)
+    text = re.sub(r'["“]([一-龥]{1,4})["”]', f'<mark {STYLES["person"]}>\\1</mark>', text) # 增加了中文引号支持
+    text = re.sub(r'<strong>([一-龥]{1,10})</strong>', f'<mark {STYLES["person"]}>\\1</mark>', text)
+    text = re.sub(r'\*\*([一-龥]{1,10})\*\*', f'<mark {STYLES["person"]}>\\1</mark>', text)
     
-    # === 1. 高亮人名 ===
-    # 1.1 带引号的人名：匹配中文引号、英文引号包裹的1-4个字的中文人名
+    # 1.2 [新增] 匹配 "姓+称谓" (简单版NER)
+    # 避免匹配到 "总共" 里的 "总"，要求前面是人名常见的字
     text = re.sub(
-        r'[""]([一-龥]{1,4})[""]',
-        r'<mark class="person">\1</mark>',
+        r'([张王李赵刘陈杨黄吴周徐孙马朱胡林郭何高罗][一-龥]{0,2})(经理|总|老师|工|董|总监|组长)',
+        f'<mark {STYLES["person"]}>\\1\\2</mark>',
         text
     )
-    
-    # 1.2 <strong> 标签中的人名（LLM常用格式）
-    # 匹配 <strong>唐玉</strong>、<strong>子波</strong>、<strong>李</strong> 等格式
-    # 扩展到1-10个字，支持复姓和更长的名字
-    text = re.sub(
-        r'<strong>([一-龥]{1,10})</strong>',
-        r'<mark class="person">\1</mark>',
-        text
-    )
-    
-    # 1.3 **Markdown加粗**中的人名
-    # 匹配 **唐玉**、**子波**、**李** 等格式
-    text = re.sub(
-        r'\*\*([一-龥]{1,10})\*\*',
-        r'<mark class="person">\1</mark>',
-        text
-    )
-    
-    # === 2. 高亮项目名/产品名 ===
-    # 通用项目名模式（不依赖特定名称）
+
+    # === 2. 项目名优化 ===
     project_patterns = [
-        # 大写字母项目名：OMC、ONC、FSU、AI等（2-10个连续大写字母）
-        (r'\b([A-Z]{2,10})\b', r'<mark class="project">\1</mark>'),
-        # 带"项目"、"产品"、"系统"、"平台"、"工具"、"服务"后缀的名称
-        (r'([一-龥0-9A-Za-z]{2,15}(?:项目|产品|系统|平台|工具|服务|计划|方案|库))', r'<mark class="project">\1</mark>'),
+        # 2.1 英文大写 (排除常用非项目词)
+        (r'\b(?!(?:ID|OK|NO|Yes|HI|BYE|TODO|PPT|PDF|WORD|EXCEL|CEO|CTO|CFO|HR|KPI)\b)([A-Z]{2,10})\b', 
+         f'<mark {STYLES["project"]}>\\1</mark>'),
+        
+        # 2.2 中文项目名 (收紧匹配范围，排除 "的" "了" "是" 等开头)
+        # {2,12} 限制长度，[^...] 排除常用虚词开头
+        (r'(?<![一-龥])([a-zA-Z0-9\u4e00-\u9fa5]{2,12}(?:项目|产品|系统|平台|工具|服务|计划|方案|中台|大脑))', 
+         f'<mark {STYLES["project"]}>\\1</mark>'),
     ]
     for pattern, replacement in project_patterns:
         text = re.sub(pattern, replacement, text)
-    
-    # === 3. 高亮日期和时间 ===
+
+    # === 3. 日期 (保留原逻辑，效果已经不错) ===
     date_patterns = [
-        # 周X
-        (r'(周[一二三四五六日天])', r'<mark class="date">\1</mark>'),
-        # 今天、明天、后天、昨天
-        (r'(今天|明天|后天|昨天|前天)', r'<mark class="date">\1</mark>'),
-        # 本周、下周、上周
-        (r'(本周|下周|上周|这周|上上周)', r'<mark class="date">\1</mark>'),
-        # 本月、下月、上月
-        (r'(本月|下月|上月|这个月)', r'<mark class="date">\1</mark>'),
-        # X月X日
-        (r'(\d{1,2}月\d{1,2}日)', r'<mark class="date">\1</mark>'),
-        # YYYY-MM-DD、YYYY/MM/DD
-        (r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', r'<mark class="date">\1</mark>'),
-        # 时间点：如"周五"、"周二至周三"
-        (r'(周[一二三四五六日天]至周[一二三四五六日天])', r'<mark class="date">\1</mark>'),
+        (r'(周[一二三四五六日天])', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(今天|明天|后天|昨天|前天)', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(本周|下周|上周|这周|上上周)', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(本月|下月|上月|这个月)', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(\d{1,2}月\d{1,2}日)', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', f'<mark {STYLES["date"]}>\\1</mark>'),
+        (r'(\d{1,2}:\d{2})', f'<mark {STYLES["date"]}>\\1</mark>'), # 新增：支持 14:00 这种时间
     ]
     for pattern, replacement in date_patterns:
         text = re.sub(pattern, replacement, text)
-    
-    # === 4. 高亮存疑内容（基于ASR低置信度标记）===
-    # 注意：这里高亮的是LLM已经标记为【存疑】的内容
-    # 如果ASR识别有低置信度，会用特殊标记包裹，如：【存疑：某个词】
+
+    # === 4. 存疑 (保留原逻辑) ===
     uncertain_patterns = [
-        # ASR低置信度标记（由LLM生成的存疑标记）
-        (r'【存疑[：:]\s*([^】]+)】', r'<mark class="uncertain">\1</mark>'),
-        (r'\[存疑[：:]\s*([^\]]+)\]', r'<mark class="uncertain">\1</mark>'),
+        (r'(?:【|\[)存疑[：:]\s*([^】\]]+)(?:】|\])', f'<mark {STYLES["uncertain"]}>\\1</mark>'),
     ]
     for pattern, replacement in uncertain_patterns:
         text = re.sub(pattern, replacement, text)
-    
-    logger.info("✨ 已添加高亮标记（人名、项目名、日期、ASR存疑内容）")
+
     return text
 
 class LLMService:
