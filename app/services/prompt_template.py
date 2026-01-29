@@ -50,21 +50,28 @@ class PromptTemplateService:
                 return None
             
             # 格式化映射表为提示词
-            mapping_parts = ["【名称标准化映射表】"]
-            mapping_parts.append("⚠️ 重要：在生成会议纪要时，请将以下口语化表达替换为标准名称：\n")
+            mapping_parts = ["=" * 60]
+            mapping_parts.append("🚨🚨🚨 【名称标准化映射表 - 必须严格执行】 🚨🚨🚨")
+            mapping_parts.append("=" * 60)
+            mapping_parts.append("⚠️⚠️⚠️ 这是最高优先级要求！必须将以下所有口语化表达替换为标准名称！\n")
             
             for category, mapping_dict in mappings.items():
                 if mapping_dict:
-                    mapping_parts.append(f"**{category}映射**：")
+                    mapping_parts.append(f"【{category}映射规则 - 必须100%执行】")
                     for oral, standard in mapping_dict.items():
-                        mapping_parts.append(f"  • \"{oral}\" → \"{standard}\"")
+                        # 使用更醒目的格式
+                        mapping_parts.append(f"  ❌ \"{oral}\" (禁止使用) ➜ ✅ \"{standard}\" (必须使用)")
                     mapping_parts.append("")
             
-            mapping_parts.append("📝 规则说明：")
-            mapping_parts.append("1. 如果转录文本中出现左侧的口语化表达，请在纪要中使用右侧的标准名称")
-            mapping_parts.append("2. 第一次出现时使用标准全称，后续可适当使用简称")
-            mapping_parts.append("3. 在人名后建议加上职位信息（如果转录中有提及）")
-            mapping_parts.append("4. 保持专业性和一致性\n")
+            mapping_parts.append("📋 执行规则（不可违反）：")
+            mapping_parts.append("✓ 规则1：转录文本中的左侧口语化表达 ➜ 必须100%替换为右侧标准名称")
+            mapping_parts.append("✓ 规则2：整篇纪要中不允许出现映射表左侧的任何口语化表达")
+            mapping_parts.append("✓ 规则3：所有人名必须使用标准全名，不允许使用昵称、简称")
+            mapping_parts.append("✓ 规则4：所有项目名必须使用标准全称，不允许使用口语化简称")
+            mapping_parts.append("✓ 规则5：遇到映射表中没有的新称呼，也应该尝试推断其标准名称\n")
+            mapping_parts.append("=" * 60)
+            mapping_parts.append("🔥 请在生成每一句话时都检查是否应用了映射规则！")
+            mapping_parts.append("=" * 60 + "\n")
             
             return "\n".join(mapping_parts)
             
