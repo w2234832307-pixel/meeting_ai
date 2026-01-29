@@ -5,6 +5,8 @@
 from typing import Dict, Any, Optional
 from jinja2 import Template, TemplateError
 import json
+import os
+from pathlib import Path
 
 from app.core.logger import logger
 from app.prompts.templates import get_default_template
@@ -12,6 +14,63 @@ from app.prompts.templates import get_default_template
 
 class PromptTemplateService:
     """提示词模板渲染服务"""
+    
+    @staticmethod
+    def _load_mappings() -> Optional[str]:
+        """
+        从 hotwords.json 加载映射表并格式化为提示词
+        
+        Returns:
+            格式化的映射指导文本，如果加载失败返回None
+        """
+        try:
+            # 查找 hotwords.json 文件
+            hotwords_paths = [
+                Path("funasr_standalone/hotwords.json"),  # 相对路径
+                Path(__file__).parent.parent.parent / "funasr_standalone" / "hotwords.json",  # 绝对路径
+            ]
+            
+            hotwords_file = None
+            for path in hotwords_paths:
+                if path.exists():
+                    hotwords_file = path
+                    break
+            
+            if not hotwords_file:
+                logger.debug("⚠️ 未找到 hotwords.json，跳过映射加载")
+                return None
+            
+            # 读取并解析
+            with open(hotwords_file, 'r', encoding='utf-8') as f:
+                hotwords_config = json.load(f)
+            
+            mappings = hotwords_config.get("mappings", {})
+            
+            if not mappings:
+                return None
+            
+            # 格式化映射表为提示词
+            mapping_parts = ["【名称标准化映射表】"]
+            mapping_parts.append("⚠️ 重要：在生成会议纪要时，请将以下口语化表达替换为标准名称：\n")
+            
+            for category, mapping_dict in mappings.items():
+                if mapping_dict:
+                    mapping_parts.append(f"**{category}映射**：")
+                    for oral, standard in mapping_dict.items():
+                        mapping_parts.append(f"  • \"{oral}\" → \"{standard}\"")
+                    mapping_parts.append("")
+            
+            mapping_parts.append("📝 规则说明：")
+            mapping_parts.append("1. 如果转录文本中出现左侧的口语化表达，请在纪要中使用右侧的标准名称")
+            mapping_parts.append("2. 第一次出现时使用标准全称，后续可适当使用简称")
+            mapping_parts.append("3. 在人名后建议加上职位信息（如果转录中有提及）")
+            mapping_parts.append("4. 保持专业性和一致性\n")
+            
+            return "\n".join(mapping_parts)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 加载映射表失败: {e}")
+            return None
     
     @staticmethod
     def render_prompt(
@@ -78,6 +137,13 @@ class PromptTemplateService:
                     except TemplateError as e:
                         logger.error(f"❌ 需求部分模板渲染失败: {e}")
             
+            # 3. 映射表部分（名称标准化）
+            mapping_section = ""
+            mappings_text = PromptTemplateService._load_mappings()
+            if mappings_text:
+                mapping_section = mappings_text
+                logger.info("✅ 已加载名称映射表到提示词")
+            
             # === 渲染最终 Prompt ===
             try:
                 main_template = Template(prompt_template)
@@ -88,6 +154,7 @@ class PromptTemplateService:
                     "current_transcript": current_transcript,
                     "history_section": history_section,
                     "requirement_section": requirement_section,
+                    "mapping_section": mapping_section,
                     **kwargs  # 其他自定义变量
                 }
                 

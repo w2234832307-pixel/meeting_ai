@@ -17,11 +17,13 @@ DEFAULT_TEMPLATES = {
         "prompt_template": """你是一个专业的会议纪要助手。请仔细阅读以下会议转录文本，并生成一份完整、详实的会议纪要。
 
 【会议转录文本】
-{current_transcript}
+{{ current_transcript }}
 
-{history_section}
+{{ history_section }}
 
-{requirement_section}
+{{ requirement_section }}
+
+{{ mapping_section }}
 
 【关键要求】
 ⚠️ 重要：请直接根据上面的转录文本生成实际的会议内容，不要生成模板或占位符！
@@ -79,13 +81,13 @@ DEFAULT_TEMPLATES = {
         "dynamic_sections": {
             "history_section": """
 【历史会议参考】
-{history_content}
+{{ history_content }}
 
 请在生成纪要时考虑历史背景和延续性。
 """,
             "requirement_section": """
 【用户特别要求】
-{user_requirement}
+{{ user_requirement }}
 
 ⚠️ 请在生成纪要时重点关注用户要求的内容。
 """
@@ -100,11 +102,13 @@ DEFAULT_TEMPLATES = {
         "prompt_template": """请用简洁的语言总结以下会议内容：
 
 【会议转录】
-{current_transcript}
+{{ current_transcript }}
 
-{history_section}
+{{ history_section }}
 
-{requirement_section}
+{{ requirement_section }}
+
+{{ mapping_section }}
 
 【输出要求】
 只输出以下内容（Markdown格式）：
@@ -119,11 +123,11 @@ DEFAULT_TEMPLATES = {
         "dynamic_sections": {
             "history_section": """
 【历史会议参考】
-{history_content}
+{{ history_content }}
 """,
             "requirement_section": """
 【用户要求】
-{user_requirement}
+{{ user_requirement }}
 """
         }
     },
@@ -136,11 +140,13 @@ DEFAULT_TEMPLATES = {
         "prompt_template": """你是一个资深会议记录专家。请基于以下信息生成详细的会议纪要。
 
 【当前会议转录】
-{current_transcript}
+{{ current_transcript }}
 
-{history_section}
+{{ history_section }}
 
-{requirement_section}
+{{ requirement_section }}
+
+{{ mapping_section }}
 
 【输出要求】
 1. 会议基本信息
@@ -172,13 +178,13 @@ DEFAULT_TEMPLATES = {
         "dynamic_sections": {
             "history_section": """
 【历史会议背景】
-{history_content}
+{{ history_content }}
 
 请在纪要中体现会议的延续性和发展脉络。
 """,
             "requirement_section": """
 【特别关注点】
-{user_requirement}
+{{ user_requirement }}
 
 请在纪要中重点突出这些内容。
 """
@@ -193,11 +199,13 @@ DEFAULT_TEMPLATES = {
         "prompt_template": """你是一个财务会议记录专家。请基于以下信息生成财务会议纪要。
 
 【当前会议转录】
-{current_transcript}
+{{ current_transcript }}
 
-{history_section}
+{{ history_section }}
 
-{requirement_section}
+{{ requirement_section }}
+
+{{ mapping_section }}
 
 【输出要求】
 1. 会议基本信息（时间、参与人、主题）
@@ -230,13 +238,13 @@ DEFAULT_TEMPLATES = {
         "dynamic_sections": {
             "history_section": """
 【历史财务数据参考】
-{history_content}
+{{ history_content }}
 
 请在分析时对比历史数据趋势。
 """,
             "requirement_section": """
 【财务关注重点】
-{user_requirement}
+{{ user_requirement }}
 """
         }
     }
