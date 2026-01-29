@@ -6,8 +6,8 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.schemas.task import MeetingResponse, ArchiveRequest, ArchiveResponse, TranscriptItem
 from app.services.vector import vector_service
-from app.services.asr_factory import get_asr_service
-from app.services.llm_factory import get_llm_service
+from app.services.asr_factory import get_asr_service_by_name
+from app.services.llm_factory import get_llm_service, get_llm_service_by_name
 import markdown
 from app.services.document import document_service 
 # 延迟导入 voice_service，避免阻塞主服务启动
@@ -19,60 +19,149 @@ router = APIRouter()
 
 @router.post("/process", response_model=MeetingResponse)
 async def process_meeting_audio(
-    # ========== 输入源参数 ==========
-    # 1. 音频文件流上传（单个或多个）
-    file: Optional[UploadFile] = File(None),  # 单个文件（向后兼容）
-    files: Optional[List[UploadFile]] = File(None),  # 多个文件（新增）
+    # ========== 输入源参数（以下7种方式任选其一）==========
     
-    # 2. 本地文件路径（用于测试或内部调用）
-    file_path: Optional[str] = Form(None),  # 单个路径
-    file_paths: Optional[str] = Form(None, description="多个本地文件路径（逗号分隔）"),  # 多个路径（新增）
+    files: Optional[List[UploadFile]] = File(
+        None, 
+        description="🎵 音频文件上传：\n• 支持格式：mp3/wav/m4a/mp4等\n• 支持单个或多个文件\n• 多个文件会自动合并处理"
+    ),
     
+    file_paths: Optional[str] = Form(
+        None, 
+        description="📂 本地文件路径（开发测试用）：\n• 单个：test_audio/meeting.mp3\n• 多个：audio1.mp3,audio2.mp3（逗号分隔）"
+    ),
     
-    # 3. 音频URL（腾讯云ASR要求必须是可公网访问的URL）
-    audio_url: Optional[str] = Form(None),
+    audio_urls: Optional[str] = Form(
+        None, 
+        description="🌐 音频URL地址：\n• 要求：可公网访问的URL（腾讯云ASR需要）\n• 单个：http://example.com/audio.mp3\n• 多个：url1,url2（逗号分隔）"
+    ),
     
-    # 4. 音频ID（从数据库获取）
-    audio_id: Optional[int] = Form(None),
+    audio_id: Optional[int] = Form(
+        None, 
+        description="🔢 数据库音频ID：用于处理已存储到数据库的历史音频"
+    ),
     
-    # 5. 文档文件上传（Word/PDF）
-    document_file: Optional[UploadFile] = File(None),
+    document_file: Optional[UploadFile] = File(
+        None, 
+        description="📄 文档文件上传：\n• 支持格式：Word(.docx) / PDF(.pdf) / 文本(.txt)\n• 直接提取文字生成纪要（不需要语音识别）"
+    ),
 
-    # 6. 纯文本内容
-    text_content: Optional[str] = Form(None),
+    text_content: Optional[str] = Form(
+        None, 
+        description="📝 纯文本内容：\n• 直接输入会议文本或已转录好的内容\n• 跳过语音识别步骤，直接生成纪要"
+    ),
 
     # ========== 模板参数 ==========
-    # 模板 ID (或者是本地文件的绝对路径)
-    template_id: str = Form("default"),
-    
-    # 动态模板内容（JSON字符串，优先级高于template_id）
-    prompt_template: Optional[str] = Form(None, description="自定义提示词模板（JSON格式）"),
+    template: str = Form(
+        "default", 
+        description="📋 模板配置：\n• 预设模板ID：default（标准）/ simple（简洁）/ detailed（详细）\n• 文档路径：D:\\模板.docx（自定义格式）\n• JSON字符串：自定义提示词\n• 纯文本：直接的提示词内容"
+    ),
 
     # ========== 用户需求参数 ==========
-    # 自定义指令（用户对纪要生成的特殊要求）
-    custom_instruction: Optional[str] = Form(None, description="用户对纪要生成的特殊要求"),
+    user_requirement: Optional[str] = Form(
+        None, 
+        description="✨ 特殊要求（可选）：对生成纪要的个性化需求，如\"重点关注预算讨论\"、\"简化技术细节\"等"
+    ),
     
-    # 用户需求（新增，更明确的命名）
-    user_requirement: Optional[str] = Form(None, description="用户的具体需求"),
+    # ========== 历史会议参数 ==========
+    history_meeting_ids: Optional[str] = Form(
+        None, 
+        description="🔗 关联历史会议（可选）：\n• 格式：会议ID列表，逗号分隔\n• 示例：100,101,102\n• 用途：生成纪要时参考历史会议内容"
+    ),
     
-    # ========== 历史会议参数（新增）==========
-    history_meeting_ids: Optional[str] = Form(None, description="历史会议ID列表（逗号分隔）"),
-    history_mode: str = Form("auto", description="历史会议处理模式（auto/retrieval/summary）"),
+    history_mode: str = Form(
+        "auto", 
+        description="📚 历史处理模式：\n• auto：自动判断（推荐）\n• retrieval：检索模式（查找相关历史内容）\n• summary：总结模式（提供历史会议总结）"
+    ),
     
-    # ========== 模型选择参数（新增）==========
-    llm_model: str = Form("auto", description="LLM模型（auto/deepseek/qwen3）"),
-    llm_temperature: float = Form(0.7, description="生成温度（0.0-1.0）"),
-    llm_max_tokens: int = Form(2000, description="最大生成长度"),
+    # ========== 模型配置参数 ==========
+    llm_model: str = Form(
+        "auto", 
+        description="🤖 LLM模型选择：\n• auto：自动选择（使用配置文件设置）\n• deepseek：DeepSeek API\n• qwen3：本地Qwen3模型"
+    ),
     
-    # ASR模型选择（新增）
-    asr_model: str = Form("auto", description="ASR模型（auto/tencent/funasr）"),
+    llm_temperature: float = Form(
+        0.7, 
+        description="🌡️ 生成温度（0.0-1.0）：\n• 0.3：更保守，输出更确定\n• 0.7：平衡（推荐）\n• 1.0：更有创造性，输出更多样"
+    ),
+    
+    llm_max_tokens: int = Form(
+        2000, 
+        description="📏 最大生成长度：生成纪要的最大字数（token数）"
+    ),
+    
+    asr_model: str = Form(
+        "auto", 
+        description="🎤 语音识别模型：\n• auto：自动选择（使用配置文件设置）\n• funasr：本地FunASR（推荐）\n• tencent：腾讯云ASR"
+    ),
 ):
     """
-    全能接口: 支持 音频 / 文档 / 纯文本 三大类输入
+    ## 🎯 会议纪要生成接口
     
-    ✨ 新功能：支持多音频合并处理
-    - 单个文件：file 或 file_path
-    - 多个文件：files 或 file_paths（逗号分隔）
+    **功能：** 将音频/文档/文本转换为结构化的会议纪要
+    
+    ---
+    
+    ### 📥 输入方式（以下7种任选其一）
+    
+    | 方式 | 参数 | 说明 | 场景 |
+    |-----|------|------|------|
+    | 🎵 上传音频 | `files` | 支持mp3/wav/m4a等，可多个 | 常用：会议录音 |
+    | 📂 本地路径 | `file_paths` | 逗号分隔多个路径 | 开发测试 |
+    | 🌐 音频URL | `audio_urls` | 公网可访问URL | 腾讯云ASR |
+    | 🔢 数据库ID | `audio_id` | 已存储的音频ID | 历史音频 |
+    | 📄 上传文档 | `document_file` | Word/PDF/TXT | 已有文字记录 |
+    | 📝 纯文本 | `text_content` | 直接输入文本 | 已转录内容 |
+    
+    ---
+    
+    ### 🎨 输出格式
+    
+    **模板参数** `template`：
+    - 预设模板：`default`（标准）/ `simple`（简洁）/ `detailed`（详细）
+    - 自定义文档：上传 `.docx` / `.pdf` 模板文件路径
+    - 自定义提示词：直接写提示词内容
+    
+    ---
+    
+    ### ⚙️ 可选配置
+    
+    - `user_requirement`：特殊要求（如"重点关注预算"）
+    - `history_meeting_ids`：关联历史会议ID
+    - `history_mode`：历史处理模式（auto/retrieval/summary）
+    - `llm_model`：选择LLM模型（auto/deepseek/qwen3）
+    - `asr_model`：选择ASR模型（auto/funasr/tencent）
+    
+    ---
+    
+    ### 💡 使用示例
+    
+    **示例1：上传单个音频**
+    ```python
+    files = [meeting.mp3]
+    template = "default"
+    ```
+    
+    **示例2：上传多个音频（自动合并）**
+    ```python
+    files = [part1.mp3, part2.mp3, part3.mp3]
+    template = "default"
+    ```
+    
+    **示例3：自定义模板和需求**
+    ```python
+    files = [meeting.mp3]
+    template = "D:\\模板\\周例会模板.docx"
+    user_requirement = "重点关注预算讨论和人员调整"
+    ```
+    
+    **示例4：关联历史会议**
+    ```python
+    files = [meeting.mp3]
+    template = "default"
+    history_meeting_ids = "100,101,102"
+    history_mode = "retrieval"
+    ```
     """
     temp_file_path = None  # 需要清理的临时文件路径
     temp_files = []  # 多音频临时文件列表
@@ -90,7 +179,8 @@ async def process_meeting_audio(
             is_multi_audio = True
             for idx, upload_file in enumerate(files):
                 if upload_file.filename:
-                    temp_path = settings.TEMP_DIR / f"multi_{idx}_{upload_file.filename}"
+                    # 使用UUID前缀避免并发冲突
+                    temp_path = settings.TEMP_DIR / f"multi_{uuid.uuid4().hex}_{idx}_{upload_file.filename}"
                     with open(temp_path, "wb") as buffer:
                         shutil.copyfileobj(upload_file.file, buffer)
                     audio_paths.append(str(temp_path))
@@ -116,7 +206,7 @@ async def process_meeting_audio(
             logger.info(f"🎵 多音频模式: 共 {len(audio_paths)} 个音频文件")
             
             # 获取ASR服务
-            asr_service = get_asr_service(asr_model)
+            asr_service = get_asr_service_by_name(asr_model)
             logger.info(f"🎤 使用ASR模型: {asr_model}")
             
             # 逐个识别并合并
@@ -136,8 +226,18 @@ async def process_meeting_audio(
                 if transcript:
                     max_speaker_id = 0
                     for item in transcript:
-                        if item.get("speaker_id"):
+                        if item.get("speaker_id") is not None:
                             original_id = item["speaker_id"]
+                            # 统一转换为整数处理
+                            if isinstance(original_id, str):
+                                # 如果是字符串（如 "spk0"），提取数字部分
+                                try:
+                                    original_id = int(''.join(filter(str.isdigit, original_id)) or "0")
+                                except:
+                                    original_id = 0
+                            else:
+                                original_id = int(original_id)
+                            
                             item["speaker_id"] = original_id + current_speaker_offset
                             max_speaker_id = max(max_speaker_id, item["speaker_id"])
                     
@@ -159,7 +259,8 @@ async def process_meeting_audio(
             logger.info(f"📝 多音频合并完成: {len(audio_paths)} 个文件, 总长度 {len(raw_text)} 字")
         
         # === 单音频处理分支（原有逻辑） ===
-        elif file or file_path or audio_id or audio_url:
+        # 处理单个文件/URL/ID的情况
+        elif (files and len(files) == 1) or file_paths or audio_id or audio_urls:
             # ✅ 使用print确保终端显示
             print(f"\n{'='*80}")
             print(f"📨 收到新的音频处理请求")
@@ -168,21 +269,35 @@ async def process_meeting_audio(
             sys.stderr.flush()
             sys.stdout.flush()
             
-            logger.info(f"📨 收到音频处理请求: 模板={template_id}")
+            logger.info(f"📨 收到音频处理请求: 模板={template}")
             
             target_audio_path = ""
 
             # 分支 1: 传了文件流 - 直接保存
-            if file:
-                temp_file_path = settings.TEMP_DIR / f"upload_{file.filename}"
+            if files and len(files) == 1:
+                upload_file = files[0]
+                # 使用UUID前缀避免并发冲突
+                temp_file_path = settings.TEMP_DIR / f"upload_{uuid.uuid4().hex}_{upload_file.filename}"
                 with open(temp_file_path, "wb") as buffer:
-                    shutil.copyfileobj(file.file, buffer)
+                    shutil.copyfileobj(upload_file.file, buffer)
                 target_audio_path = str(temp_file_path)
                 logger.info(f"💾 音频流已保存: {target_audio_path}")
             
             # 分支 2: 传了本地文件路径 - 直接使用（用于测试或内部调用）
-            elif file_path:
-                import os
+            elif file_paths:
+                # 支持单个或多个路径（如果是多个，只取第一个）
+                paths = [p.strip() for p in file_paths.split(',') if p.strip()]
+                target_path = paths[0] if paths else None
+                
+                if not target_path:
+                    return MeetingResponse(
+                        status="failed",
+                        message="file_paths 参数为空",
+                        transcript=[]
+                    )
+                
+                file_path = target_path  # 临时变量，用于后续处理
+                
                 if not os.path.exists(file_path):
                     return MeetingResponse(
                         status="failed",
@@ -209,7 +324,18 @@ async def process_meeting_audio(
             
             # 分支 4: 传了音频URL - 直接使用（腾讯云ASR要求）
             # 也支持音频地址 (支持 URL 或 本地路径)
-            elif audio_url:
+            elif audio_urls:
+                # 支持单个或多个URL（如果是多个，只取第一个）
+                urls = [url.strip() for url in audio_urls.split(',') if url.strip()]
+                audio_url = urls[0] if urls else None
+                
+                if not audio_url:
+                    return MeetingResponse(
+                        status="failed",
+                        message="audio_urls 参数为空",
+                        transcript=[]
+                    )
+                
                 # 1. 清洗输入 (去掉可能存在的引号和空格，防止 copy 路径带引号)
                 clean_path = audio_url.strip().strip('"').strip("'").strip()
                 
@@ -269,7 +395,6 @@ async def process_meeting_audio(
 
             # 获取 ASR 服务（动态选择）⭐
             try:
-                from app.services.asr_factory import get_asr_service_by_name
                 asr_service = get_asr_service_by_name(asr_model)
                 logger.info(f"🎤 使用ASR模型: {asr_model}")
             except Exception as e:
@@ -293,7 +418,7 @@ async def process_meeting_audio(
 
         # --- 情况 B: 处理文档（Word/PDF）---
         elif document_file:
-            logger.info(f"📄 收到文档处理请求: 文件名={document_file.filename}, 模板={template_id}")
+            logger.info(f"📄 收到文档处理请求: 文件名={document_file.filename}, 模板={template}")
             
             file_ext = os.path.splitext(document_file.filename)[1].lower()
             if file_ext not in ['.docx', '.pdf', '.txt']:
@@ -303,7 +428,8 @@ async def process_meeting_audio(
                     transcript=[]
                 )
             
-            temp_file_path = settings.TEMP_DIR / f"doc_{document_file.filename}"
+            # 使用UUID前缀避免并发冲突
+            temp_file_path = settings.TEMP_DIR / f"doc_{uuid.uuid4().hex}_{document_file.filename}"
             with open(temp_file_path, "wb") as buffer:
                 shutil.copyfileobj(document_file.file, buffer)
             logger.info(f"💾 文档已保存: {temp_file_path}")
@@ -343,8 +469,8 @@ async def process_meeting_audio(
         # ---------------------------------------------------------
         history_context = None
         
-        # 合并用户需求（custom_instruction 和 user_requirement）
-        final_user_requirement = user_requirement or custom_instruction
+        # 用户需求（已在向后兼容处理中合并）
+        final_user_requirement = user_requirement
         
         if history_meeting_ids:
             # 解析历史会议ID列表
@@ -396,7 +522,6 @@ async def process_meeting_audio(
 
         try:
             # 动态选择模型（新增）⭐
-            from app.services.llm_factory import get_llm_service_by_name
             llm_service = get_llm_service_by_name(llm_model)
             
             # 设置 LLM 参数
@@ -424,11 +549,11 @@ async def process_meeting_audio(
         # 1. 使用动态模板渲染（新增）⭐
         from app.services.prompt_template import prompt_template_service
         
-        # 获取模板配置（优先使用 prompt_template，其次是 template_id）
-        # 现在两个参数都支持文档路径、JSON字符串或纯文本
+        # 获取模板配置（统一使用 template 参数）
+        # template 可以是：模板ID、文档路径、JSON字符串或纯文本
         template_config = prompt_template_service.get_template_config(
-            prompt_template=prompt_template,
-            template_id=template_id
+            prompt_template=None,  # 不再使用废弃参数
+            template_id=template    # 使用新的统一参数
         )
         
         # 渲染最终的提示词
