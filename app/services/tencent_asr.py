@@ -61,8 +61,7 @@ class TencentASRService:
     
     def transcribe(self, file_path: str) -> Dict[str, Any]:
         """
-        [修正版] 识别音频文件
-        由于 _poll_task_result 已经处理好了所有解析逻辑，这里只需要直接返回即可。
+        识别音频文件
         """
         try:
             logger.info(f"🎤 开始识别音频文件: {file_path}")
@@ -75,7 +74,7 @@ class TencentASRService:
                     raise ASRServiceException(f"音频文件不存在: {file_path}")
                 file_url = file_path
             
-            # 2. 调用识别 (这一步里面已经包含了轮询和结果解析)
+            # 2. 调用识别 
             # result 已经是 {'text': '...', 'transcript': [...]} 的格式了
             result = self._call_create_rec_task(file_url)
             

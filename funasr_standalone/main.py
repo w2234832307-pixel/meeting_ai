@@ -69,22 +69,51 @@ try:
     
     logger.info(f"⚙️ 加载模型中... (Device: {DEVICE}, Threads: {NCPU})")
     
-    # =================== 配置1：小模型（推荐，显存占用小）===================
-    # ✅ 使用标准Paraformer模型（显存占用约4-6GB）
-    model = AutoModel(
-        model="paraformer-zh",                          # 标准中文模型
-        vad_model="fsmn-vad",                          # VAD模型
-        punc_model="ct-punc",                          # 标点模型
-        spk_model="cam++",                             # 说话人识别
+    # =================== 配置：SenseVoiceSmall 高准确率方案 ===================
+    # 策略：SenseVoiceSmall 用于高准确率识别，VAD 和说话人分离独立处理
+    
+    # 1. SenseVoiceSmall 主模型（仅识别，不使用 spk_model）
+    logger.info("📦 加载 SenseVoiceSmall 主模型（高准确率识别）...")
+    asr_model = AutoModel(
+        model="iic/SenseVoiceSmall",
         device=DEVICE,
         ncpu=NCPU,
-        disable_update=True,
-        quantize=False
+        disable_update=True
     )
+    logger.info("✅ SenseVoiceSmall 加载成功")
     
-    # =================== 配置2：大模型（注释，需要12GB+显存）===================
-    # # ⭐ Paraformer-Large大模型（带VAD和标点，支持完整时间戳和说话人分离）
-    # # 显存需求：12-16GB，准确率最高，功能最完整
+    # 2. VAD 模型（用于获取时间戳）
+    logger.info("📦 加载 VAD 模型（时间戳分割）...")
+    vad_model = AutoModel(
+        model="fsmn-vad",
+        device=DEVICE,
+        disable_update=True
+    )
+    logger.info("✅ VAD 模型加载成功")
+    
+    # 3. 说话人识别模型（用于声纹提取和聚类）
+    logger.info("📦 加载 Cam++ 说话人模型（说话人分离）...")
+    speaker_model = AutoModel(
+        model="iic/speech_campplus_sv_zh-cn_16k-common",
+        device=DEVICE,
+        disable_update=True
+    )
+    logger.info("✅ Cam++ 说话人模型加载成功")
+    
+    # =================== 旧模型配置（已注释，可回退）===================
+    # # Paraformer-zh（标准模型）
+    # model = AutoModel(
+    #     model="paraformer-zh",
+    #     vad_model="fsmn-vad",
+    #     punc_model="ct-punc",
+    #     spk_model="cam++",
+    #     device=DEVICE,
+    #     ncpu=NCPU,
+    #     disable_update=True,
+    #     quantize=False
+    # )
+    
+    # # Paraformer-Large（大模型，需要12GB+显存）
     # model = AutoModel(
     #     model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
     #     model_revision="v2.0.4",
@@ -95,7 +124,7 @@ try:
     #     quantize=False
     # )
     
-    logger.info("✅ FunASR 模型加载成功！服务就绪。")
+    logger.info("✅ 所有模型加载成功！服务就绪。")
     
 except Exception as e:
     logger.critical(f"❌ 模型加载失败: {e}", exc_info=True)
@@ -170,32 +199,142 @@ async def transcribe(
             combined_hotwords = hotword
         
         # === 开始推理 ===
-        logger.info(f"Processing... Hotword:{len(combined_hotwords)} chars")
+        logger.info(f"🎤 开始语音识别... (热词: {len(combined_hotwords)} 字符)")
 
-        res = model.generate(
-            input=input_data, 
-            batch_size_s=300, 
-            hotword=combined_hotwords,  # ✅ 使用合并后的热词
-            batch_size_token=5000,      # token批处理大小
-            batch_size_token_threshold_s=60  # 时间阈值
+        # ===== 步骤1：使用 VAD 获取语音段时间戳 =====
+        logger.info("🎤 步骤1: VAD 语音分段...")
+        vad_res = vad_model.generate(
+            input=input_data,
+            batch_size_s=60  # 每60秒一段
         )
         
-        # 3. 结果解析（包含时间戳和说话人ID）
-        full_text = ""
-        html_text = ""
-        transcript = []
-        if res and len(res) > 0:
-            result = res[0]
-            full_text = result.get("text", "")
-
-            # 高亮功能已移除：主服务不使用 html 字段
-            html_text = full_text  # 暂时保持字段兼容性
+        # 提取 VAD 分段信息
+        vad_segments = []
+        if vad_res and len(vad_res) > 0:
+            vad_result = vad_res[0]
+            vad_segments = vad_result.get("value", [])
+        
+        if not vad_segments or len(vad_segments) == 0:
+            logger.warning("⚠️ VAD 未检测到语音段，使用全文识别")
+            vad_segments = [[0, -1]]  # 使用整个音频
+        
+        logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
+        
+        # ===== 步骤2：对每个 VAD 段用 SenseVoiceSmall 识别 =====
+        logger.info("🎤 步骤2: SenseVoiceSmall 逐段识别...")
+        
+        # 使用临时文件路径（如果有）
+        audio_file_path = str(temp_file_path) if temp_file_path else input_data
+        
+        # 对每个 VAD 段单独识别（获取精确的文本和时间对应关系）
+        segment_results = []
+        full_text_parts = []
+        
+        for idx, segment in enumerate(vad_segments):
+            if not isinstance(segment, list) or len(segment) < 2:
+                continue
             
-            # 调试：打印返回的数据结构键
-            logger.info(f"🔍 FunASR返回的数据字段: {list(result.keys())}")
+            start_ms, end_ms = segment[0], segment[1]
             
-            # ===== 方案1: 句子级别（带说话人） =====
-            sentence_info = result.get("sentence_info", None)
+            # 提取音频片段并识别
+            try:
+                import subprocess
+                import tempfile as tmp
+                
+                # 创建临时音频片段
+                temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
+                temp_segment.close()
+                temp_segment_path = temp_segment.name
+                
+                # 使用 ffmpeg 提取片段
+                cmd = ["ffmpeg", "-i", audio_file_path, "-ss", str(start_ms / 1000.0)]
+                
+                if end_ms != -1:
+                    duration = (end_ms - start_ms) / 1000.0
+                    cmd.extend(["-t", str(duration)])
+                
+                cmd.extend([
+                    "-ac", "1", "-ar", "16000",
+                    "-y", "-loglevel", "error",
+                    temp_segment_path
+                ])
+                
+                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+                
+                # 识别该片段
+                seg_res = asr_model.generate(
+                    input=temp_segment_path,
+                    language="zh",
+                    use_itn=True
+                )
+                
+                # 清理临时文件
+                try:
+                    os.remove(temp_segment_path)
+                except:
+                    pass
+                
+                if seg_res and len(seg_res) > 0:
+                    text = seg_res[0].get("text", "").strip()
+                    
+                    # 清理 SenseVoice 的语言标签
+                    import re
+                    text = re.sub(r'<\|[^|]+\|>', '', text).strip()
+                    
+                    if text:
+                        segment_results.append({
+                            "start_time": round(start_ms / 1000.0, 2),
+                            "end_time": round(end_ms / 1000.0, 2) if end_ms != -1 else 999999,
+                            "text": text,
+                            "segment_idx": idx
+                        })
+                        full_text_parts.append(text)
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ 识别片段 {idx} 失败: {e}")
+                continue
+        
+        full_text = "".join(full_text_parts)
+        logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段，文本长度: {len(full_text)} 字")
+        
+        # ===== 步骤3：为每个 VAD 段提取声纹并聚类 =====
+        logger.info("🎤 步骤3: 说话人分离...")
+        
+        # 调用说话人分离函数
+        from speaker_diarization import perform_speaker_diarization_with_vad
+        
+        speaker_info = perform_speaker_diarization_with_vad(
+            audio_path=audio_file_path,
+            vad_segments=vad_segments,
+            speaker_model=speaker_model,
+            device=DEVICE
+        )
+        
+        # 将说话人信息合并到识别结果
+        speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
+        
+        for result in segment_results:
+            seg_idx = result.get('segment_idx', -1)
+            result['speaker_id'] = speaker_dict.get(seg_idx, "0")
+        
+        n_speakers = len(set(r['speaker_id'] for r in segment_results))
+        logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人")
+        
+        # ===== 步骤4：构建最终结果 =====
+        html_text = full_text  # 保持兼容性
+        transcript = segment_results
+        
+        # 清理 transcript 中的临时字段
+        for item in transcript:
+            if 'segment_idx' in item:
+                del item['segment_idx']
+        
+        logger.info(f"✅ 最终结果: {len(transcript)} 个片段, {len(set(t['speaker_id'] for t in transcript))} 个说话人")
+        
+        # 兼容旧的解析逻辑（以下代码不会执行，但保留以防万一）
+        if False:  # 禁用旧逻辑
+            result = {}
+            sentence_info = None
             
             if sentence_info and len(sentence_info) > 0:
                 logger.info(f"✅ 使用句子级别解析（含说话人识别）")
@@ -213,8 +352,8 @@ async def transcribe(
                         start_ms = 0
                         end_ms = 0
                     
-                    # 说话人ID
-                    speaker_id = str(sent.get("spk", "unknown"))
+                    # 说话人ID（SenseVoiceSmall 使用 speaker_id 字段）
+                    speaker_id = str(sent.get("speaker_id", sent.get("spk", "0")))
                     
                     # ✅ 提取置信度（如果有）
                     confidence = sent.get("confidence", None)
@@ -303,6 +442,46 @@ async def transcribe(
                     })
 
         logger.info(f"✅ 识别成功: {file.filename} (长度: {len(full_text)}字)")
+        
+        # ===== 热词后处理替换（SenseVoiceSmall 专用）=====
+        # SenseVoiceSmall 不支持原生热词，需要在结果中进行文本替换
+        try:
+            if combined_hotwords:
+                hotword_svc = get_hotword_service()
+                # 读取 hotwords.json 文件获取 mappings
+                import json
+                hotwords_path = Path(__file__).parent / "hotwords.json"
+                if hotwords_path.exists():
+                    with open(hotwords_path, 'r', encoding='utf-8') as f:
+                        hotwords_data = json.load(f)
+                    mappings = hotwords_data.get("mappings", {})
+                else:
+                    mappings = {}
+                
+                if mappings:
+                    # 合并所有映射表
+                    all_mappings = {}
+                    for category, mapping_dict in mappings.items():
+                        if isinstance(mapping_dict, dict):
+                            all_mappings.update(mapping_dict)
+                    
+                    if all_mappings:
+                        logger.info(f"🔄 应用热词映射: {len(all_mappings)} 个")
+                        
+                        # 对 transcript 中的每个文本进行替换
+                        for item in transcript:
+                            text = item.get("text", "")
+                            for oral_form, standard_form in all_mappings.items():
+                                text = text.replace(oral_form, standard_form)
+                            item["text"] = text
+                        
+                        # 同时更新 full_text
+                        for oral_form, standard_form in all_mappings.items():
+                            full_text = full_text.replace(oral_form, standard_form)
+                        
+                        logger.info("✅ 热词替换完成")
+        except Exception as e:
+            logger.warning(f"⚠️ 热词替换失败: {e}")
         
         # ===== 声纹识别（可选，如果声纹库为空则跳过）=====
         matched_info = {}

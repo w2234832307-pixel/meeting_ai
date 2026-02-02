@@ -292,7 +292,6 @@ if __name__ == "__main__":
         print("=" * 80)
         print("📚 ChromaDB 数据查看工具")
         print("=" * 80)
-        print("\n使用方法:")
         print("  python view_chroma_data.py --view              # 查看所有数据")
         print("  python view_chroma_data.py --meeting 1001      # 查看特定会议")
         print("  python view_chroma_data.py --search '项目进展'  # 语义搜索")

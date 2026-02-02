@@ -28,7 +28,7 @@ async def process_meeting_audio(
     
     file_paths: Optional[str] = Form(
         None, 
-        description="📂 本地文件路径（开发测试用）：\n• 单个：test_audio/meeting.mp3\n• 多个：audio1.mp3,audio2.mp3（逗号分隔）"
+        description="📂 本地文件路径：\n• 单个：test_audio/meeting.mp3\n• 多个：audio1.mp3,audio2.mp3（逗号分隔）"
     ),
     
     audio_urls: Optional[str] = Form(
