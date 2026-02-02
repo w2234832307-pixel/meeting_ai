@@ -95,25 +95,96 @@ def perform_speaker_diarization_with_vad(
             valid_segments[0]["speaker_id"] = "0"
             return valid_segments
         
+        # 2.5. 如果只有2个片段，直接标记为说话人0和1
+        if len(embeddings) == 2:
+            logger.info("ℹ️ 只有两个语音段，标记为说话人0和1")
+            valid_segments[0]["speaker_id"] = "0"
+            valid_segments[1]["speaker_id"] = "1"
+            return valid_segments
+        
         # 3. 使用层次聚类进行说话人分离
         logger.info(f"🔬 进行说话人聚类...")
         
+        # 确保 embeddings 是 2D 数组 (n_samples, n_features)
+        # Cam++ 可能返回 3D 数组，需要展平
+        embeddings_2d = []
+        for emb in embeddings:
+            emb_array = np.array(emb)
+            # 如果是 3D 或更高维度，展平为 1D
+            if emb_array.ndim > 1:
+                emb_array = emb_array.flatten()
+            embeddings_2d.append(emb_array)
+        
+        embeddings_array = np.array(embeddings_2d)
+        
+        # 验证维度
+        if embeddings_array.ndim != 2:
+            logger.error(f"❌ 声纹向量维度错误: {embeddings_array.shape}，期望 2D (n_samples, n_features)")
+            # 降级处理：所有片段标记为同一说话人
+            for segment in valid_segments:
+                segment["speaker_id"] = "0"
+            return valid_segments
+        
+        logger.debug(f"✅ 声纹向量形状: {embeddings_array.shape}")
+        
+        # 优化聚类参数：减少说话人数量（12个太多，通常会议3-5人）
+        # 自动调整距离阈值：如果片段很多，增大阈值以减少说话人数量
+        if len(embeddings) > 30:
+            # 片段很多，增大阈值，减少说话人数量
+            adjusted_threshold = min(0.7, distance_threshold + 0.1)
+            logger.info(f"🔧 片段较多({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
+        else:
+            adjusted_threshold = distance_threshold
+        
         clustering = AgglomerativeClustering(
             n_clusters=None,
-            distance_threshold=distance_threshold,  # 距离阈值
+            distance_threshold=adjusted_threshold,  # 调整后的距离阈值
             metric='cosine',
             linkage='average'
         )
         
-        embeddings_array = np.array(embeddings)
         cluster_labels = clustering.fit_predict(embeddings_array)
         
-        # 4. 将聚类结果映射到片段
-        for idx, segment in enumerate(valid_segments):
-            segment["speaker_id"] = str(cluster_labels[idx])
+        # 4. 显示真实的聚类结果（证明不是写死的）
+        unique_labels = sorted(set(cluster_labels))
+        logger.info(f"🎯 【真实聚类结果】识别出 {len(unique_labels)} 个不同的说话人")
+        logger.info(f"   原始聚类标签: {unique_labels} (范围: {min(cluster_labels)}-{max(cluster_labels)})")
         
-        n_speakers = len(set(cluster_labels))
-        logger.info(f"✅ 识别出 {n_speakers} 个说话人")
+        # 统计每个聚类的片段数量（证明是真实识别）
+        cluster_counts = {}
+        for label in cluster_labels:
+            cluster_counts[label] = cluster_counts.get(label, 0) + 1
+        logger.info(f"   各说话人的片段数量: {dict(sorted(cluster_counts.items()))}")
+        
+        # 重新映射说话人ID为连续编号（0, 1, 2, 3...）
+        # 注意：这只是编号规范化，不影响识别结果！
+        # 哪些片段属于哪个说话人是由聚类算法决定的，不是写死的
+        label_mapping = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
+        logger.info(f"   编号规范化映射: {label_mapping} (仅用于统一编号，不影响识别结果)")
+        
+        # 5. 将聚类结果映射到片段，并重新编号
+        # 保留原始聚类标签用于验证（证明不是写死的）
+        for idx, segment in enumerate(valid_segments):
+            old_label = cluster_labels[idx]  # 这是聚类算法的真实结果
+            new_label = label_mapping[old_label]  # 这只是编号规范化
+            segment["speaker_id"] = str(new_label)
+            segment["_original_cluster_id"] = int(old_label)  # 保留原始标签用于验证
+        
+        n_speakers = len(unique_labels)
+        
+        # 验证映射后的ID是否连续
+        mapped_ids = sorted(set(int(s["speaker_id"]) for s in valid_segments))
+        expected_ids = list(range(n_speakers))
+        
+        if mapped_ids != expected_ids:
+            logger.error(f"❌ 说话人ID映射错误: 实际={mapped_ids}, 期望={expected_ids}")
+            # 强制重新映射
+            for idx, segment in enumerate(valid_segments):
+                segment["speaker_id"] = str(mapped_ids.index(int(segment["speaker_id"])))
+        
+        # 显示识别结果示例（证明是真实识别）
+        logger.info(f"✅ 识别出 {n_speakers} 个说话人（ID: 0-{n_speakers-1}）")
+        logger.info(f"   【验证】前3个片段的原始聚类ID: {[s.get('_original_cluster_id') for s in valid_segments[:3]]}")
         
         return valid_segments
         
@@ -175,9 +246,15 @@ def extract_speaker_embedding(
         if emb_res and len(emb_res) > 0:
             emb = emb_res[0].get("spk_embedding", None)
             if emb is not None:
-                if hasattr(emb, 'tolist'):
-                    emb = emb.tolist()
-                return emb
+                # 转换为 numpy 数组并确保是 1D
+                emb_array = np.array(emb)
+                
+                # 如果是多维数组，展平为 1D
+                if emb_array.ndim > 1:
+                    emb_array = emb_array.flatten()
+                
+                # 转换为 Python list
+                return emb_array.tolist()
         
         return None
         

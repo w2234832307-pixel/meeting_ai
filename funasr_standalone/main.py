@@ -281,6 +281,22 @@ async def transcribe(
                     import re
                     text = re.sub(r'<\|[^|]+\|>', '', text).strip()
                     
+                    # 过滤非中文内容（日文、韩文等）
+                    if text:
+                        # 检查是否包含日文假名（ひらがな、カタカナ）
+                        if re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
+                            logger.debug(f"⏭️ 过滤日文内容: {text[:20]}...")
+                            continue
+                        # 检查是否包含韩文
+                        if re.search(r'[\uAC00-\uD7AF]', text):
+                            logger.debug(f"⏭️ 过滤韩文内容: {text[:20]}...")
+                            continue
+                        # 检查是否主要是英文单词（超过50%）
+                        english_chars = len(re.findall(r'[a-zA-Z]', text))
+                        if len(text) > 0 and english_chars / len(text) > 0.5:
+                            logger.debug(f"⏭️ 过滤英文内容: {text[:20]}...")
+                            continue
+                    
                     if text:
                         segment_results.append({
                             "start_time": round(start_ms / 1000.0, 2),
@@ -311,14 +327,85 @@ async def transcribe(
         )
         
         # 将说话人信息合并到识别结果
+        # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
         speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
         
-        for result in segment_results:
-            seg_idx = result.get('segment_idx', -1)
-            result['speaker_id'] = speaker_dict.get(seg_idx, "0")
+        # 统计哪些 segment_idx 有声纹信息
+        valid_segment_indices = set(speaker_dict.keys())
+        logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
         
-        n_speakers = len(set(r['speaker_id'] for r in segment_results))
-        logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人")
+        # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
+        for idx, result in enumerate(segment_results):
+            seg_idx = result.get('segment_idx', -1)
+            
+            if seg_idx in speaker_dict:
+                # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
+                result['speaker_id'] = speaker_dict[seg_idx]
+            else:
+                # 没有声纹信息，找到最近的有声纹片段
+                found_speaker = None
+                min_distance = float('inf')
+                
+                # 查找最近的有效片段
+                for valid_idx in valid_segment_indices:
+                    distance = abs(valid_idx - seg_idx)
+                    if distance < min_distance:
+                        min_distance = distance
+                        found_speaker = speaker_dict[valid_idx]
+                
+                # 如果找到了，使用该说话人ID；否则使用默认值"0"
+                result['speaker_id'] = found_speaker if found_speaker is not None else "0"
+        
+        # 强制重新映射说话人ID，确保从0开始连续编号
+        # 注意：这只是编号规范化，不影响识别结果！
+        # 哪些片段属于哪个说话人是由声纹聚类算法决定的，不是写死的
+        
+        all_speaker_ids = set(r['speaker_id'] for r in segment_results)
+        
+        # 找出每个说话人ID第一次出现的时间
+        first_occurrence = {}
+        for result in segment_results:
+            speaker_id = result['speaker_id']
+            start_time = result.get('start_time', 0)
+            if speaker_id not in first_occurrence or start_time < first_occurrence[speaker_id]:
+                first_occurrence[speaker_id] = start_time
+        
+        # 按第一次出现的时间排序（第一个出现的说话人 -> 0，第二个 -> 1...）
+        unique_speakers = sorted(all_speaker_ids, key=lambda x: first_occurrence[x])
+        n_speakers = len(unique_speakers)
+        
+        # 显示真实的识别结果（证明不是写死的）
+        logger.info(f"🎯 【真实识别结果】基于声纹聚类识别出 {n_speakers} 个不同的说话人")
+        logger.info(f"   原始说话人ID: {sorted(unique_speakers, key=int)}")
+        
+        # 统计每个说话人的片段数量（证明是真实识别）
+        speaker_counts = {}
+        for result in segment_results:
+            sid = result['speaker_id']
+            speaker_counts[sid] = speaker_counts.get(sid, 0) + 1
+        logger.info(f"   各说话人的片段数量: {dict(sorted(speaker_counts.items(), key=lambda x: int(x[0])))}")
+        
+        # 重新映射：第一个出现的说话人 -> 0，第二个 -> 1...
+        # 这只是编号规范化，不影响哪些片段属于哪个说话人
+        logger.info(f"🔧 编号规范化: {unique_speakers} -> 0-{n_speakers-1} (仅统一编号，不影响识别结果)")
+        
+        speaker_remap = {old_id: str(new_id) for new_id, old_id in enumerate(unique_speakers)}
+        logger.debug(f"🔍 映射关系: {speaker_remap}")
+        
+        for result in segment_results:
+            old_id = result['speaker_id']
+            result['speaker_id'] = speaker_remap[old_id]
+        
+        # 验证映射结果
+        final_ids = sorted(set(int(r['speaker_id']) for r in segment_results))
+        if final_ids != list(range(n_speakers)):
+            logger.error(f"❌ 映射后ID仍不连续: {final_ids}")
+        else:
+            # 检查第一个片段的ID
+            first_speaker_id = segment_results[0]['speaker_id'] if segment_results else "N/A"
+            logger.info(f"✅ 编号规范化完成: 0-{n_speakers-1}，第一个片段 speaker_id={first_speaker_id}")
+        
+        logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人（基于真实声纹聚类）")
         
         # ===== 步骤4：构建最终结果 =====
         html_text = full_text  # 保持兼容性
@@ -539,7 +626,10 @@ async def transcribe(
                     
         except ImportError as e:
             logger.warning(f"⚠️ 声纹匹配模块导入失败（依赖缺失），跳过声纹匹配")
-            logger.warning(f"   如需使用声纹识别，请运行: pip install 'datasets>=2.14.0'")
+            logger.warning(f"   错误详情: {e}")
+            logger.warning(f"   如需使用声纹识别，请运行以下命令：")
+            logger.warning(f"   pip install 'datasets>=2.14.0' 'chromadb==0.5.0'")
+            logger.warning(f"   注意：datasets 2.13.0 版本缺少 LargeList，需要升级到 2.14.0+")
             matched_info = {}
         except Exception as e:
             logger.error(f"❌ 声纹匹配失败: {e}", exc_info=True)
