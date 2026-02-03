@@ -52,7 +52,8 @@ class PyannoteService:
                         "start_time": float(item.get("start_time", 0.0)),
                         "end_time": float(item.get("end_time", 0.0)),
                         # speaker_id 如果已有，也带过去，但 Pyannote 会覆盖
-                        "speaker_id": item.get("speaker_id"),
+                        # 确保 speaker_id 是字符串类型（Pyannote API 要求）
+                        "speaker_id": str(item.get("speaker_id")) if item.get("speaker_id") is not None else None,
                     }
                     for item in transcript
                 ],

@@ -37,6 +37,17 @@ app.add_middleware(
 # 注册路由
 app.include_router(router, prefix="/api/v1", tags=["会议处理"])
 
+# 在启动时初始化 Pyannote 服务（如果配置了）
+try:
+    from app.services.pyannote_service import get_pyannote_service
+    pyannote_service = get_pyannote_service()
+    if pyannote_service.is_available():
+        logger.info(f"✅ Pyannote 服务已就绪: {pyannote_service.base_url}")
+    else:
+        logger.info("ℹ️ 未配置 PYANNOTE_SERVICE_URL，将使用 FunASR 内置说话人分离")
+except Exception as e:
+    logger.warning(f"⚠️ Pyannote 服务初始化失败: {e}")
+
 
 @app.get("/")
 async def root():

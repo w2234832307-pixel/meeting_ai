@@ -257,6 +257,35 @@ async def process_meeting_audio(
             # 合并所有文本
             raw_text = "\n".join([item.get("text", "") for item in transcript_data])
             logger.info(f"📝 多音频合并完成: {len(audio_paths)} 个文件, 总长度 {len(raw_text)} 字")
+            
+            # ---------------------------------------------
+            # 可选：调用独立 Pyannote 服务进行说话人分离（方案B）
+            # 仅在配置了 PYANNOTE_SERVICE_URL 且只有一个音频文件时启用
+            # （多音频文件时，Pyannote 需要分别处理每个文件，这里简化处理）
+            # ---------------------------------------------
+            if len(audio_paths) == 1:
+                try:
+                    from app.services.pyannote_service import get_pyannote_service
+                    pyannote_service = get_pyannote_service()
+                    
+                    if pyannote_service.is_available() and transcript_data:
+                        single_audio_path = audio_paths[0]
+                        if not single_audio_path.startswith(("http://", "https://")):
+                            logger.info("🎤 使用独立 Pyannote 服务优化说话人分离（方案B）")
+                            transcript_data = pyannote_service.diarize(
+                                audio_path=single_audio_path,
+                                transcript=transcript_data,
+                            )
+                        else:
+                            logger.info("ℹ️ 目标音频为 URL，当前 Pyannote 仅支持本地文件，跳过")
+                    elif not pyannote_service.is_available():
+                        logger.info("ℹ️ 未配置 PYANNOTE_SERVICE_URL，跳过 Pyannote 分离")
+                    elif not transcript_data:
+                        logger.info("ℹ️ transcript 为空，跳过 Pyannote 分离")
+                except Exception as e:
+                    logger.warning(f"⚠️ 调用 Pyannote 服务失败，保持原有说话人结果: {e}")
+            else:
+                logger.info(f"ℹ️ 多音频模式（{len(audio_paths)} 个文件），当前版本暂不支持 Pyannote 优化")
         
         # === 单音频处理分支（原有逻辑） ===
         # 处理单个文件/URL/ID的情况
