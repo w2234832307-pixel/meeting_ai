@@ -52,30 +52,80 @@ def perform_pyannote_diarization(
         # https://huggingface.co/pyannote/speaker-diarization-3.1
         try:
             import os
+            from pathlib import Path
+            
             # 优先使用传入的 token，其次从环境变量读取
             hf_token = use_auth_token or os.getenv("HF_TOKEN")
-            if hf_token:
-                # 新版本的 transformers 使用 token 参数，而不是 use_auth_token
-                try:
-                    pipeline = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        token=hf_token
-                    )
-                except TypeError:
-                    # 兼容旧版本，如果 token 参数不支持，尝试 use_auth_token
-                    pipeline = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        use_auth_token=hf_token
-                    )
-            else:
-                # 尝试不使用token（如果模型是公开的）
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+            
+            # 检查本地缓存目录（Pyannote 通常缓存到 ~/.cache/pyannote/ 或 ~/.cache/huggingface/）
+            cache_dirs = [
+                Path.home() / ".cache" / "pyannote",
+                Path.home() / ".cache" / "huggingface" / "hub",
+            ]
+            
+            model_cached = False
+            for cache_dir in cache_dirs:
+                if cache_dir.exists():
+                    # 检查是否有 speaker-diarization-3.1 的缓存
+                    model_path = cache_dir / "models--pyannote--speaker-diarization-3.1"
+                    if model_path.exists():
+                        model_cached = True
+                        logger.info(f"✅ 检测到本地模型缓存: {model_path}")
+                        break
+            
+            # 尝试加载模型
+            try:
+                if hf_token:
+                    # 新版本的 transformers 使用 token 参数，而不是 use_auth_token
+                    try:
+                        pipeline = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            token=hf_token
+                        )
+                    except TypeError:
+                        # 兼容旧版本，如果 token 参数不支持，尝试 use_auth_token
+                        pipeline = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=hf_token
+                        )
+                else:
+                    # 尝试不使用token（如果模型是公开的或已缓存）
+                    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+                logger.info("✅ Pyannote 模型加载成功")
+            except Exception as load_error:
+                error_str = str(load_error).lower()
+                if "network" in error_str or "unreachable" in error_str or "connection" in error_str:
+                    if model_cached:
+                        logger.warning(f"⚠️ 网络不可达，但检测到本地缓存，尝试使用缓存...")
+                        # 如果网络不可达但有缓存，尝试强制使用本地
+                        try:
+                            # 尝试从缓存目录直接加载
+                            pipeline = Pipeline.from_pretrained(
+                                "pyannote/speaker-diarization-3.1",
+                                local_files_only=True  # 仅使用本地文件
+                            )
+                            logger.info("✅ 成功使用本地缓存加载模型")
+                        except Exception as local_error:
+                            logger.error(f"❌ 无法使用本地缓存: {local_error}")
+                            raise load_error  # 抛出原始错误
+                    else:
+                        logger.error(f"❌ 网络不可达且无本地缓存: {load_error}")
+                        logger.error("   解决方案:")
+                        logger.error("   1. 确保网络可以访问 HuggingFace，或配置代理")
+                        logger.error("   2. 手动下载模型到本地缓存:")
+                        logger.error("      python -c \"from pyannote.audio import Pipeline; Pipeline.from_pretrained('pyannote/speaker-diarization-3.1', token='YOUR_TOKEN')\"")
+                        logger.error("   3. 或使用已下载的模型路径")
+                        raise load_error
+                else:
+                    raise load_error
+                    
         except Exception as e:
             logger.error(f"❌ 加载 Pyannote 模型失败: {e}")
             logger.error("   请确保:")
             logger.error("   1. 已安装 pyannote.audio: pip install pyannote.audio")
             logger.error("   2. 在 HuggingFace 上接受模型使用协议: https://huggingface.co/pyannote/speaker-diarization-3.1")
-            logger.error("   3. 如果需要，提供 token 参数（或通过 HF_TOKEN 环境变量）")
+            logger.error("   3. 如果网络不可达，请先在有网络的机器上下载模型，然后复制缓存目录")
+            logger.error("   4. 缓存目录通常在: ~/.cache/pyannote/ 或 ~/.cache/huggingface/hub/")
             # 降级：返回原始transcript
             for item in transcript:
                 if 'speaker_id' not in item:
