@@ -715,59 +715,107 @@ async def transcribe(
         full_text = "".join(full_text_parts)
         logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段，文本长度: {len(full_text)} 字")
         
-        # ===== 步骤3：说话人分离（优化：复用步骤2的音频数据）=====
-        logger.info("🎤 步骤3: 说话人分离（优化：复用缓存音频）...")
+        # ===== 步骤3：说话人分离（支持Pyannote和Cam++两种方案）=====
+        # 检查是否使用Pyannote（通过环境变量或配置）
+        use_pyannote = os.getenv("USE_PYANNOTE", "false").lower() == "true"
         
-        # 优化2: 复用步骤2提取的音频数据，避免重复提取
-        from speaker_diarization import perform_speaker_diarization_with_cached_audio
+        if use_pyannote:
+            logger.info("🎤 步骤3: 使用 Pyannote.audio 进行说话人分离（专业模型）...")
+            try:
+                from pyannote_diarization import perform_pyannote_diarization
+                
+                # 准备transcript格式的数据
+                transcript_for_pyannote = [
+                    {
+                        "text": result.get("text", ""),
+                        "start_time": result.get("start_time", 0),
+                        "end_time": result.get("end_time", 0)
+                    }
+                    for result in segment_results
+                ]
+                
+                # 使用Pyannote进行说话人分离
+                transcript_with_speakers = perform_pyannote_diarization(
+                    audio_path=audio_file_path,
+                    transcript=transcript_for_pyannote
+                )
+                
+                # 将说话人信息合并到segment_results
+                for i, result in enumerate(segment_results):
+                    if i < len(transcript_with_speakers):
+                        result['speaker_id'] = transcript_with_speakers[i].get('speaker_id', '0')
+                    else:
+                        result['speaker_id'] = '0'
+                
+                logger.info("✅ Pyannote 说话人分离完成")
+                speaker_info = []  # Pyannote不需要speaker_info
+                
+            except ImportError:
+                logger.warning("⚠️ Pyannote 未安装，降级使用 Cam++ 方案")
+                logger.warning("   安装命令: pip install pyannote.audio")
+                use_pyannote = False
+            except Exception as e:
+                logger.error(f"❌ Pyannote 说话人分离失败: {e}，降级使用 Cam++ 方案")
+                use_pyannote = False
         
-        # 构建缓存的音频数据映射
-        cached_audio_map = {
-            result['segment_idx']: result.get('_audio_data')
-            for result in segment_results
-            if '_audio_data' in result
-        }
-        
-        # 调用优化后的说话人分离函数（使用缓存的音频数据）
-        speaker_info = perform_speaker_diarization_with_cached_audio(
-            vad_segments=vad_segments,
-            cached_audio_map=cached_audio_map,
-            speaker_model=speaker_model,
-            device=DEVICE,
-            min_segment_duration=1.0,  # 最小片段时长1秒
-            distance_threshold=0.3,  # 降低阈值，确保能识别出多个说话人（默认0.5太高）
-            audio_file_path=audio_file_path  # 降级时使用原始文件
-        )
+        if not use_pyannote:
+            logger.info("🎤 步骤3: 使用 Cam++ 进行说话人分离（优化：复用缓存音频）...")
+            
+            # 优化2: 复用步骤2提取的音频数据，避免重复提取
+            from speaker_diarization import perform_speaker_diarization_with_cached_audio
+            
+            # 构建缓存的音频数据映射
+            cached_audio_map = {
+                result['segment_idx']: result.get('_audio_data')
+                for result in segment_results
+                if '_audio_data' in result
+            }
+            
+            # 调用优化后的说话人分离函数（使用缓存的音频数据）
+            speaker_info = perform_speaker_diarization_with_cached_audio(
+                vad_segments=vad_segments,
+                cached_audio_map=cached_audio_map,
+                speaker_model=speaker_model,
+                device=DEVICE,
+                min_segment_duration=2.0,  # 提高最小片段时长到2秒
+                distance_threshold=0.2,  # 进一步降低阈值到0.2
+                audio_file_path=audio_file_path  # 降级时使用原始文件
+            )
         
         # 将说话人信息合并到识别结果
-        # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
-        speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
-        
-        # 统计哪些 segment_idx 有声纹信息
-        valid_segment_indices = set(speaker_dict.keys())
-        logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
-        
-        # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
-        for idx, result in enumerate(segment_results):
-            seg_idx = result.get('segment_idx', -1)
+        if not use_pyannote:
+            # Cam++ 方案：需要映射speaker_info到segment_results
+            # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
+            speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
             
-            if seg_idx in speaker_dict:
-                # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
-                result['speaker_id'] = speaker_dict[seg_idx]
-            else:
-                # 没有声纹信息，找到最近的有声纹片段
-                found_speaker = None
-                min_distance = float('inf')
+            # 统计哪些 segment_idx 有声纹信息
+            valid_segment_indices = set(speaker_dict.keys())
+            logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
+            
+            # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
+            for idx, result in enumerate(segment_results):
+                seg_idx = result.get('segment_idx', -1)
                 
-                # 查找最近的有效片段
-                for valid_idx in valid_segment_indices:
-                    distance = abs(valid_idx - seg_idx)
-                    if distance < min_distance:
-                        min_distance = distance
-                        found_speaker = speaker_dict[valid_idx]
-                
-                # 如果找到了，使用该说话人ID；否则使用默认值"0"
-                result['speaker_id'] = found_speaker if found_speaker is not None else "0"
+                if seg_idx in speaker_dict:
+                    # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
+                    result['speaker_id'] = speaker_dict[seg_idx]
+                else:
+                    # 没有声纹信息，找到最近的有声纹片段
+                    found_speaker = None
+                    min_distance = float('inf')
+                    
+                    # 查找最近的有效片段
+                    for valid_idx in valid_segment_indices:
+                        distance = abs(valid_idx - seg_idx)
+                        if distance < min_distance:
+                            min_distance = distance
+                            found_speaker = speaker_dict[valid_idx]
+                    
+                    # 如果找到了，使用该说话人ID；否则使用默认值"0"
+                    result['speaker_id'] = found_speaker if found_speaker is not None else "0"
+        else:
+            # Pyannote 方案：已经直接更新了segment_results，不需要额外处理
+            logger.debug("✅ Pyannote 已直接更新说话人信息，跳过映射步骤")
         
         # 强制重新映射说话人ID，确保从0开始连续编号
         # 注意：这只是编号规范化，不影响识别结果！

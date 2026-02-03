@@ -58,9 +58,9 @@ def perform_speaker_diarization_with_vad(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 提高声纹提取质量：要求更长的片段（至少3秒，确保声纹质量）
+            # 提高声纹提取质量：要求更长的片段（至少5秒，确保声纹质量）
             # 短片段声纹质量差，会导致聚类不准确
-            MIN_EMBEDDING_DURATION = 3.0  # 至少3秒，确保声纹质量
+            MIN_EMBEDDING_DURATION = 5.0  # 至少5秒，确保声纹质量（从3秒提高到5秒）
             if duration < MIN_EMBEDDING_DURATION:
                 logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s (需要至少{MIN_EMBEDDING_DURATION}秒以确保声纹质量)")
                 continue
@@ -147,14 +147,15 @@ def perform_speaker_diarization_with_vad(
             logger.info(f"🔧 片段较少({len(embeddings)}个)，大幅降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
         
         # 额外检查：如果阈值仍然太高，强制降低（确保能识别出多个说话人）
-        if adjusted_threshold > 0.3:
-            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.25 以确保识别多个说话人")
-            adjusted_threshold = 0.25
+        # 进一步优化：更激进的阈值调整
+        if adjusted_threshold > 0.25:
+            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.2 以确保识别多个说话人")
+            adjusted_threshold = 0.2
         
         # 如果片段数量很多但阈值还是太高，进一步降低
-        if len(embeddings) > 30 and adjusted_threshold > 0.25:
-            logger.warning(f"⚠️ 片段较多({len(embeddings)}个)但阈值{adjusted_threshold:.2f}可能过高，强制降低到 0.2")
-            adjusted_threshold = 0.2
+        if len(embeddings) > 20 and adjusted_threshold > 0.2:
+            logger.warning(f"⚠️ 片段较多({len(embeddings)}个)但阈值{adjusted_threshold:.2f}可能过高，强制降低到 0.15")
+            adjusted_threshold = 0.15
         
         # 优化聚类算法：尝试不同的linkage方法
         # 'ward': 最小方差法，适合欧氏距离（但这里用cosine，可能不是最优）
@@ -277,9 +278,9 @@ def perform_speaker_diarization_with_cached_audio(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 提高声纹提取质量：要求更长的片段（至少3秒，确保声纹质量）
+            # 提高声纹提取质量：要求更长的片段（至少5秒，确保声纹质量）
             # 短片段声纹质量差，会导致聚类不准确
-            MIN_EMBEDDING_DURATION = 3.0  # 至少3秒，确保声纹质量
+            MIN_EMBEDDING_DURATION = 5.0  # 至少5秒，确保声纹质量（从3秒提高到5秒）
             if duration < MIN_EMBEDDING_DURATION:
                 logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s (需要至少{MIN_EMBEDDING_DURATION}秒以确保声纹质量)")
                 return None, None

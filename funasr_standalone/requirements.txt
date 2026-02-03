@@ -23,6 +23,11 @@ simplejson>=3.19.0  # modelscope 依赖
 sortedcontainers>=2.4.0  # modelscope/chromadb 依赖
 soundfile>=0.12.0  # 音频内存处理（优化）
 
+# Pyannote 说话人分离（可选，专业模型）
+# pyannote.audio>=3.1.0  # 取消注释以启用Pyannote
+# 注意：首次使用需要在 HuggingFace 上接受模型使用协议
+# https://huggingface.co/pyannote/speaker-diarization-3.1
+
 # ChromaDB 声纹库
 chromadb==0.5.0
 datasets>=2.17.0
