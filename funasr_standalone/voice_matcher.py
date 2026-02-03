@@ -178,7 +178,8 @@ class VoiceMatcher:
             
             speaker_times[speaker_id].append((start_time, end_time))
         
-        # 2. 为每个说话人提取音频片段
+        # 2. 为每个说话人提取音频片段（每个speaker_id只提取一次）
+        logger.info(f"🔍 开始为 {len(speaker_times)} 个不同的speaker_id提取音频片段（每个ID只提取一次）")
         for speaker_id, times in speaker_times.items():
             if speaker_id == "unknown":
                 continue
@@ -204,7 +205,7 @@ class VoiceMatcher:
                     logger.warning(f"⚠️ 说话人 {speaker_id} 没有足够长的音频片段")
                     continue
                 
-                # 提取第一段（最长的）
+                # 提取第一段（最长的）- 每个speaker_id只提取一次
                 start, end = selected_segments[0]
                 segment_path = self._extract_audio_segment(
                     audio_path, 
@@ -215,7 +216,7 @@ class VoiceMatcher:
                 
                 if segment_path:
                     speaker_segments[speaker_id] = segment_path
-                    logger.info(f"✅ 提取说话人 {speaker_id} 音频: {start:.1f}s - {end:.1f}s")
+                    logger.info(f"✅ 提取说话人 {speaker_id} 音频片段（唯一）: {start:.1f}s - {end:.1f}s (共{len(times)}个时间段，只提取1次)")
                 
             except Exception as e:
                 logger.error(f"❌ 提取说话人 {speaker_id} 音频失败: {e}")
@@ -294,8 +295,10 @@ class VoiceMatcher:
         
         matched = {}
         
+        logger.info(f"🔍 开始匹配 {len(speaker_segments)} 个不同的speaker_id（每个ID只匹配一次）")
         for speaker_id, audio_path in speaker_segments.items():
             try:
+                logger.debug(f"🔍 匹配说话人 {speaker_id}（唯一匹配，不会重复）")
                 # 1. 提取声纹向量
                 vector = self._extract_vector(audio_path)
                 

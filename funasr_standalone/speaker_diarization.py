@@ -144,10 +144,15 @@ def perform_speaker_diarization_with_vad(
             adjusted_threshold = max(0.2, distance_threshold - 0.15)  # 最低0.2
             logger.info(f"🔧 片段较少({len(embeddings)}个)，大幅降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
         
-        # 额外检查：如果阈值仍然太高，强制降低
-        if adjusted_threshold > 0.4:
-            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.35")
-            adjusted_threshold = 0.35
+        # 额外检查：如果阈值仍然太高，强制降低（确保能识别出多个说话人）
+        if adjusted_threshold > 0.3:
+            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.25 以确保识别多个说话人")
+            adjusted_threshold = 0.25
+        
+        # 如果片段数量很多但阈值还是太高，进一步降低
+        if len(embeddings) > 30 and adjusted_threshold > 0.25:
+            logger.warning(f"⚠️ 片段较多({len(embeddings)}个)但阈值{adjusted_threshold:.2f}可能过高，强制降低到 0.2")
+            adjusted_threshold = 0.2
         
         clustering = AgglomerativeClustering(
             n_clusters=None,
@@ -283,6 +288,13 @@ def perform_speaker_diarization_with_cached_audio(
                     if emb_res and len(emb_res) > 0:
                         emb = emb_res[0].get("spk_embedding", None)
                         if emb is not None:
+                            # 修复CUDA tensor转numpy错误
+                            import torch
+                            if isinstance(emb, torch.Tensor):
+                                emb = emb.cpu().numpy()
+                            elif hasattr(emb, 'cpu'):
+                                emb = emb.cpu().numpy()
+                            
                             emb_array = np.array(emb)
                             if emb_array.ndim > 1:
                                 emb_array = emb_array.flatten()
@@ -494,6 +506,13 @@ def extract_speaker_embedding(
         if emb_res and len(emb_res) > 0:
             emb = emb_res[0].get("spk_embedding", None)
             if emb is not None:
+                # 修复CUDA tensor转numpy错误
+                import torch
+                if isinstance(emb, torch.Tensor):
+                    emb = emb.cpu().numpy()
+                elif hasattr(emb, 'cpu'):
+                    emb = emb.cpu().numpy()
+                
                 # 转换为 numpy 数组并确保是 1D
                 emb_array = np.array(emb)
                 

@@ -271,8 +271,21 @@ async def transcribe(
             merged_segments = []
             current_segment = None
             
-            MIN_SEGMENT_DURATION_MS = 5000  # 最小片段时长5秒（增加，避免切太细）
-            MAX_GAP_MS = 2000  # 最大间隔2秒（增加，合并更多相邻片段）
+            # 动态调整：根据片段数量调整合并策略
+            if len(vad_segments) > 200:
+                # 片段非常多，更激进的合并
+                MIN_SEGMENT_DURATION_MS = 8000  # 最小片段时长8秒
+                MAX_GAP_MS = 3000  # 最大间隔3秒
+            elif len(vad_segments) > 100:
+                # 片段较多，中等合并
+                MIN_SEGMENT_DURATION_MS = 6000  # 最小片段时长6秒
+                MAX_GAP_MS = 2500  # 最大间隔2.5秒
+            else:
+                # 片段较少，标准合并
+                MIN_SEGMENT_DURATION_MS = 5000  # 最小片段时长5秒
+                MAX_GAP_MS = 2000  # 最大间隔2秒
+            
+            logger.info(f"🔧 合并策略: 最小片段{MIN_SEGMENT_DURATION_MS/1000:.1f}秒, 最大间隔{MAX_GAP_MS/1000:.1f}秒")
             
             for segment in vad_segments:
                 if not isinstance(segment, list) or len(segment) < 2:
@@ -315,12 +328,18 @@ async def transcribe(
                         # 先处理之前的片段
                         if current_segment[1] != -1:
                             prev_duration = current_segment[1] - current_segment[0]
-                        if prev_duration >= MIN_SEGMENT_DURATION_MS:
-                            merged_segments.append(current_segment)
-                        else:
-                            # 太短，强制合并到下一个片段（避免丢内容）
-                            # 不丢弃，继续尝试合并
-                            pass
+                            if prev_duration >= MIN_SEGMENT_DURATION_MS:
+                                merged_segments.append(current_segment)
+                            else:
+                                # 太短，强制合并到最后一个片段（避免丢内容）
+                                if len(merged_segments) > 0:
+                                    last_segment = merged_segments[-1]
+                                    if last_segment[1] != -1:
+                                        last_segment[1] = current_segment[1]
+                                    logger.debug(f"🔧 将短片段合并到前一个片段，避免丢内容")
+                                else:
+                                    # 如果没有前面的片段，强制添加（避免丢内容）
+                                    merged_segments.append(current_segment)
                         
                         # 处理当前片段
                         if duration_ms >= MIN_SEGMENT_DURATION_MS:
