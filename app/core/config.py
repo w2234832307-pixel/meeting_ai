@@ -52,6 +52,10 @@ class Settings:
     CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8000"))
     CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "employee_voice_library")
     
+    # --- Pyannote 说话人分离服务（可选，方案B：独立服务）---
+    # 示例：PYANNOTE_SERVICE_URL=http://localhost:8100
+    PYANNOTE_SERVICE_URL: str = os.getenv("PYANNOTE_SERVICE_URL", "")
+    
     # --- ASR服务配置 ---
     ASR_SERVICE_TYPE: str = os.getenv("ASR_SERVICE_TYPE", "tencent")  # tencent / funasr
     
