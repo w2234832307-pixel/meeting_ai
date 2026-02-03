@@ -116,9 +116,20 @@ class FunASRService:
             
             with open(file_path_obj, "rb") as f:
                 files = {"file": (file_path_obj.name, f, "audio/mpeg")}
+                # 检查是否配置了 Pyannote 服务
+                try:
+                    from app.services.pyannote_service import get_pyannote_service
+                    pyannote_service = get_pyannote_service()
+                    enable_diarization = not pyannote_service.is_available()
+                except Exception:
+                    # 如果导入失败，默认启用说话人分离
+                    enable_diarization = True
+                
                 data = {
                     "enable_punc": True,
-                    "enable_vad": True
+                    "enable_vad": True,
+                    # 如果配置了 Pyannote 服务，禁用 FunASR 内部的说话人分离
+                    "enable_speaker_diarization": enable_diarization
                 }
                 
                 response = requests.post(

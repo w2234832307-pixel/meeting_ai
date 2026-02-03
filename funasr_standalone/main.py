@@ -193,7 +193,8 @@ async def transcribe(
     file: UploadFile = File(None), 
     # 2. url 参数
     audio_url: str = Form(None),   
-    hotword: str = Form("")  # 外部传入的热词（可选）
+    hotword: str = Form(""),  # 外部传入的热词（可选）
+    enable_speaker_diarization: bool = Form(True)  # 是否启用说话人分离（默认启用，主服务用Pyannote时可设为False）
 ):
     temp_file_path = None
     input_data = None 
@@ -716,77 +717,85 @@ async def transcribe(
         logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段，文本长度: {len(full_text)} 字")
         
         # ===== 步骤3：说话人分离（支持Pyannote和Cam++两种方案）=====
-        # 检查是否使用Pyannote（通过环境变量或配置）
-        use_pyannote = os.getenv("USE_PYANNOTE", "false").lower() == "true"
-        
-        if use_pyannote:
-            logger.info("🎤 步骤3: 使用 Pyannote.audio 进行说话人分离（专业模型）...")
-            try:
-                from pyannote_diarization import perform_pyannote_diarization
+        # 如果主服务禁用说话人分离（将使用外部Pyannote服务），则跳过
+        if not enable_speaker_diarization:
+            logger.info("ℹ️ 说话人分离已禁用（将由主服务使用Pyannote处理）")
+            # 为所有片段设置默认 speaker_id
+            for result in segment_results:
+                result['speaker_id'] = '0'
+            speaker_info = []
+        else:
+            # 检查是否使用Pyannote（通过环境变量或配置）
+            use_pyannote = os.getenv("USE_PYANNOTE", "false").lower() == "true"
+            
+            if use_pyannote:
+                logger.info("🎤 步骤3: 使用 Pyannote.audio 进行说话人分离（专业模型）...")
+                try:
+                    from pyannote_diarization import perform_pyannote_diarization
+                    
+                    # 准备transcript格式的数据
+                    transcript_for_pyannote = [
+                        {
+                            "text": result.get("text", ""),
+                            "start_time": result.get("start_time", 0),
+                            "end_time": result.get("end_time", 0)
+                        }
+                        for result in segment_results
+                    ]
+                    
+                    # 使用Pyannote进行说话人分离
+                    transcript_with_speakers = perform_pyannote_diarization(
+                        audio_path=audio_file_path,
+                        transcript=transcript_for_pyannote
+                    )
+                    
+                    # 将说话人信息合并到segment_results
+                    for i, result in enumerate(segment_results):
+                        if i < len(transcript_with_speakers):
+                            result['speaker_id'] = transcript_with_speakers[i].get('speaker_id', '0')
+                        else:
+                            result['speaker_id'] = '0'
+                    
+                    logger.info("✅ Pyannote 说话人分离完成")
+                    speaker_info = []  # Pyannote不需要speaker_info
+                    
+                except ImportError:
+                    logger.warning("⚠️ Pyannote 未安装，降级使用 Cam++ 方案")
+                    logger.warning("   安装命令: pip install pyannote.audio")
+                    use_pyannote = False
+                except Exception as e:
+                    logger.error(f"❌ Pyannote 说话人分离失败: {e}，降级使用 Cam++ 方案")
+                    use_pyannote = False
+            
+            if not use_pyannote:
+                logger.info("🎤 步骤3: 使用 Cam++ 进行说话人分离（优化：复用缓存音频）...")
                 
-                # 准备transcript格式的数据
-                transcript_for_pyannote = [
-                    {
-                        "text": result.get("text", ""),
-                        "start_time": result.get("start_time", 0),
-                        "end_time": result.get("end_time", 0)
-                    }
+                # 优化2: 复用步骤2提取的音频数据，避免重复提取
+                from speaker_diarization import perform_speaker_diarization_with_cached_audio
+                
+                # 构建缓存的音频数据映射
+                cached_audio_map = {
+                    result['segment_idx']: result.get('_audio_data')
                     for result in segment_results
-                ]
+                    if '_audio_data' in result
+                }
                 
-                # 使用Pyannote进行说话人分离
-                transcript_with_speakers = perform_pyannote_diarization(
-                    audio_path=audio_file_path,
-                    transcript=transcript_for_pyannote
+                # 调用优化后的说话人分离函数（使用缓存的音频数据）
+                speaker_info = perform_speaker_diarization_with_cached_audio(
+                    vad_segments=vad_segments,
+                    cached_audio_map=cached_audio_map,
+                    speaker_model=speaker_model,
+                    device=DEVICE,
+                    min_segment_duration=2.0,  # 提高最小片段时长到2秒
+                    distance_threshold=0.2,  # 进一步降低阈值到0.2
+                    audio_file_path=audio_file_path  # 降级时使用原始文件
                 )
-                
-                # 将说话人信息合并到segment_results
-                for i, result in enumerate(segment_results):
-                    if i < len(transcript_with_speakers):
-                        result['speaker_id'] = transcript_with_speakers[i].get('speaker_id', '0')
-                    else:
-                        result['speaker_id'] = '0'
-                
-                logger.info("✅ Pyannote 说话人分离完成")
-                speaker_info = []  # Pyannote不需要speaker_info
-                
-            except ImportError:
-                logger.warning("⚠️ Pyannote 未安装，降级使用 Cam++ 方案")
-                logger.warning("   安装命令: pip install pyannote.audio")
-                use_pyannote = False
-            except Exception as e:
-                logger.error(f"❌ Pyannote 说话人分离失败: {e}，降级使用 Cam++ 方案")
-                use_pyannote = False
-        
-        if not use_pyannote:
-            logger.info("🎤 步骤3: 使用 Cam++ 进行说话人分离（优化：复用缓存音频）...")
             
-            # 优化2: 复用步骤2提取的音频数据，避免重复提取
-            from speaker_diarization import perform_speaker_diarization_with_cached_audio
-            
-            # 构建缓存的音频数据映射
-            cached_audio_map = {
-                result['segment_idx']: result.get('_audio_data')
-                for result in segment_results
-                if '_audio_data' in result
-            }
-            
-            # 调用优化后的说话人分离函数（使用缓存的音频数据）
-            speaker_info = perform_speaker_diarization_with_cached_audio(
-                vad_segments=vad_segments,
-                cached_audio_map=cached_audio_map,
-                speaker_model=speaker_model,
-                device=DEVICE,
-                min_segment_duration=2.0,  # 提高最小片段时长到2秒
-                distance_threshold=0.2,  # 进一步降低阈值到0.2
-                audio_file_path=audio_file_path  # 降级时使用原始文件
-            )
-        
-        # 将说话人信息合并到识别结果
-        if not use_pyannote:
-            # Cam++ 方案：需要映射speaker_info到segment_results
-            # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
-            speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
+            # 将说话人信息合并到识别结果
+            if not use_pyannote:
+                # Cam++ 方案：需要映射speaker_info到segment_results
+                # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
+                speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
             
             # 统计哪些 segment_idx 有声纹信息
             valid_segment_indices = set(speaker_dict.keys())
@@ -813,9 +822,9 @@ async def transcribe(
                     
                     # 如果找到了，使用该说话人ID；否则使用默认值"0"
                     result['speaker_id'] = found_speaker if found_speaker is not None else "0"
-        else:
-            # Pyannote 方案：已经直接更新了segment_results，不需要额外处理
-            logger.debug("✅ Pyannote 已直接更新说话人信息，跳过映射步骤")
+            else:
+                # Pyannote 方案：已经直接更新了segment_results，不需要额外处理
+                logger.debug("✅ Pyannote 已直接更新说话人信息，跳过映射步骤")
         
         # 强制重新映射说话人ID，确保从0开始连续编号
         # 注意：这只是编号规范化，不影响识别结果！

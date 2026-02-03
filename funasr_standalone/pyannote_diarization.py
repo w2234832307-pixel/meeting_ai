@@ -55,10 +55,18 @@ def perform_pyannote_diarization(
             # 优先使用传入的 token，其次从环境变量读取
             hf_token = use_auth_token or os.getenv("HF_TOKEN")
             if hf_token:
-                pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token
-                )
+                # 新版本的 transformers 使用 token 参数，而不是 use_auth_token
+                try:
+                    pipeline = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        token=hf_token
+                    )
+                except TypeError:
+                    # 兼容旧版本，如果 token 参数不支持，尝试 use_auth_token
+                    pipeline = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        use_auth_token=hf_token
+                    )
             else:
                 # 尝试不使用token（如果模型是公开的）
                 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
@@ -67,7 +75,7 @@ def perform_pyannote_diarization(
             logger.error("   请确保:")
             logger.error("   1. 已安装 pyannote.audio: pip install pyannote.audio")
             logger.error("   2. 在 HuggingFace 上接受模型使用协议: https://huggingface.co/pyannote/speaker-diarization-3.1")
-            logger.error("   3. 如果需要，提供 use_auth_token 参数")
+            logger.error("   3. 如果需要，提供 token 参数（或通过 HF_TOKEN 环境变量）")
             # 降级：返回原始transcript
             for item in transcript:
                 if 'speaker_id' not in item:
