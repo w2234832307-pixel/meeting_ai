@@ -52,10 +52,12 @@ def perform_pyannote_diarization(
         # https://huggingface.co/pyannote/speaker-diarization-3.1
         try:
             import os
-            if use_auth_token:
+            # 优先使用传入的 token，其次从环境变量读取
+            hf_token = use_auth_token or os.getenv("HF_TOKEN")
+            if hf_token:
                 pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    use_auth_token=os.getenv("HF_TOKEN")
+                    use_auth_token=hf_token
                 )
             else:
                 # 尝试不使用token（如果模型是公开的）
