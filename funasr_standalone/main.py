@@ -264,33 +264,38 @@ async def transcribe(
         
         logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
         
-        # ===== 步骤2：对每个 VAD 段用 SenseVoiceSmall 识别 =====
-        logger.info("🎤 步骤2: SenseVoiceSmall 逐段识别...")
+        # ===== 步骤2：批量提取片段并识别（优化：批量处理 + 内存缓存）=====
+        logger.info("🎤 步骤2: SenseVoiceSmall 批量识别（优化版）...")
         
         # 使用临时文件路径（如果有）
         audio_file_path = str(temp_file_path) if temp_file_path else input_data
         
-        # 对每个 VAD 段单独识别（获取精确的文本和时间对应关系）
-        segment_results = []
-        full_text_parts = []
+        # 配置：10GB显存优化
+        BATCH_SIZE = 8  # 每批处理8个片段（10GB显存）
+        MAX_CONCURRENT = 2  # 最多2个并发线程
         
-        for idx, segment in enumerate(vad_segments):
+        import subprocess
+        import tempfile as tmp
+        import re
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import io
+        import soundfile as sf
+        import numpy as np
+        
+        # 优化1&4: 批量提取片段到内存，避免频繁磁盘I/O
+        logger.info(f"📦 批量提取 {len(vad_segments)} 个音频片段到内存...")
+        segment_audio_data = {}  # {segment_idx: (audio_data, sample_rate)}
+        segment_metadata = {}  # {segment_idx: (start_ms, end_ms)}
+        
+        def extract_segment_to_memory(idx, segment):
+            """提取单个片段到内存"""
             if not isinstance(segment, list) or len(segment) < 2:
-                continue
+                return None, None
             
             start_ms, end_ms = segment[0], segment[1]
             
-            # 提取音频片段并识别
             try:
-                import subprocess
-                import tempfile as tmp
-                
-                # 创建临时音频片段
-                temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
-                temp_segment.close()
-                temp_segment_path = temp_segment.name
-                
-                # 使用 ffmpeg 提取片段
+                # 使用 ffmpeg 提取到内存（通过管道）
                 cmd = ["ffmpeg", "-i", audio_file_path, "-ss", str(start_ms / 1000.0)]
                 
                 if end_ms != -1:
@@ -299,75 +304,336 @@ async def transcribe(
                 
                 cmd.extend([
                     "-ac", "1", "-ar", "16000",
-                    "-y", "-loglevel", "error",
-                    temp_segment_path
+                    "-f", "wav",
+                    "-"  # 输出到stdout
                 ])
                 
-                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+                # 提取音频数据到内存
+                result = subprocess.run(
+                    cmd, 
+                    check=True, 
+                    capture_output=True, 
+                    timeout=30
+                )
                 
-                # 识别该片段
-                seg_res = asr_model.generate(
-                    input=temp_segment_path,
+                # 从内存中读取音频数据
+                audio_io = io.BytesIO(result.stdout)
+                audio_data, sample_rate = sf.read(audio_io)
+                
+                return (audio_data, sample_rate), (start_ms, end_ms)
+                
+            except Exception as e:
+                logger.warning(f"⚠️ 提取片段 {idx} 失败: {e}")
+                return None, None
+        
+        # 优化3: 并行提取片段（控制并发数）
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+            futures = {
+                executor.submit(extract_segment_to_memory, idx, segment): idx 
+                for idx, segment in enumerate(vad_segments)
+            }
+            
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    audio_data_info, metadata = future.result()
+                    if audio_data_info is not None:
+                        segment_audio_data[idx] = audio_data_info
+                        segment_metadata[idx] = metadata
+                except Exception as e:
+                    logger.warning(f"⚠️ 提取片段 {idx} 异常: {e}")
+        
+        logger.info(f"✅ 成功提取 {len(segment_audio_data)} 个片段到内存")
+        
+        # 优化2: 批量识别（分批处理，避免显存溢出）
+        segment_results = []
+        full_text_parts = []
+        
+        # 按segment_idx排序，确保顺序
+        sorted_indices = sorted(segment_audio_data.keys())
+        
+        # 分批处理
+        for batch_start in range(0, len(sorted_indices), BATCH_SIZE):
+            batch_indices = sorted_indices[batch_start:batch_start + BATCH_SIZE]
+            logger.info(f"🔄 批量识别片段 {batch_start+1}-{min(batch_start+BATCH_SIZE, len(sorted_indices))}/{len(sorted_indices)}")
+            
+            # 将内存中的音频数据写入临时文件（批量识别需要文件路径）
+            batch_files = []
+            batch_metadata = []
+            
+            for idx in batch_indices:
+                audio_data, sample_rate = segment_audio_data[idx]
+                start_ms, end_ms = segment_metadata[idx]
+                
+                # 写入临时文件（批量识别需要）
+                temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
+                temp_segment.close()
+                temp_segment_path = temp_segment.name
+                
+                sf.write(temp_segment_path, audio_data, sample_rate)
+                batch_files.append(temp_segment_path)
+                batch_metadata.append((idx, start_ms, end_ms))
+            
+            # 批量识别
+            try:
+                batch_results = asr_model.generate(
+                    input=batch_files,
                     language="zh",
                     use_itn=True
                 )
                 
-                # 清理临时文件
-                try:
-                    os.remove(temp_segment_path)
-                except:
-                    pass
-                
-                if seg_res and len(seg_res) > 0:
-                    text = seg_res[0].get("text", "").strip()
-                    
-                    # 清理 SenseVoice 的语言标签
-                    import re
-                    text = re.sub(r'<\|[^|]+\|>', '', text).strip()
-                    
-                    # 过滤非中文内容（日文、韩文等）
-                    if text:
-                        # 检查是否包含日文假名（ひらがな、カタカナ）
-                        if re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
-                            logger.debug(f"⏭️ 过滤日文内容: {text[:20]}...")
-                            continue
-                        # 检查是否包含韩文
-                        if re.search(r'[\uAC00-\uD7AF]', text):
-                            logger.debug(f"⏭️ 过滤韩文内容: {text[:20]}...")
-                            continue
-                        # 检查是否主要是英文单词（超过50%）
-                        english_chars = len(re.findall(r'[a-zA-Z]', text))
-                        if len(text) > 0 and english_chars / len(text) > 0.5:
-                            logger.debug(f"⏭️ 过滤英文内容: {text[:20]}...")
-                            continue
-                    
-                    if text:
-                        segment_results.append({
-                            "start_time": round(start_ms / 1000.0, 2),
-                            "end_time": round(end_ms / 1000.0, 2) if end_ms != -1 else 999999,
-                            "text": text,
-                            "segment_idx": idx
-                        })
-                        full_text_parts.append(text)
+                # 处理批量识别结果 - 按句子切分
+                for i, (idx, start_ms, end_ms) in enumerate(batch_metadata):
+                    if i < len(batch_results) and batch_results[i]:
+                        result_item = batch_results[i]
+                        text = result_item.get("text", "").strip()
                         
+                        # 清理 SenseVoice 的语言标签
+                        text = re.sub(r'<\|[^|]+\|>', '', text).strip()
+                        
+                        # 过滤非中文内容
+                        if text:
+                            # 检查是否包含日文假名
+                            if re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
+                                logger.debug(f"⏭️ 过滤日文内容: {text[:20]}...")
+                                continue
+                            # 检查是否包含韩文
+                            if re.search(r'[\uAC00-\uD7AF]', text):
+                                logger.debug(f"⏭️ 过滤韩文内容: {text[:20]}...")
+                                continue
+                            # 检查是否主要是英文单词
+                            english_chars = len(re.findall(r'[a-zA-Z]', text))
+                            if len(text) > 0 and english_chars / len(text) > 0.5:
+                                logger.debug(f"⏭️ 过滤英文内容: {text[:20]}...")
+                                continue
+                        
+                        if not text:
+                            continue
+                        
+                        # 优化：按句子切分，而不是按VAD段
+                        # 检查是否有timestamp信息（句子级别）
+                        timestamp = result_item.get("timestamp", [])
+                        sentences = result_item.get("sentences", [])
+                        
+                        if sentences and len(sentences) > 0:
+                            # 使用句子级别的信息
+                            for sent in sentences:
+                                sent_text = sent.get("text", "").strip()
+                                if not sent_text or len(sent_text) < 2:  # 过滤太短的句子
+                                    continue
+                                
+                                sent_timestamp = sent.get("timestamp", [])
+                                if sent_timestamp and len(sent_timestamp) >= 2:
+                                    sent_start = sent_timestamp[0] / 1000.0 if isinstance(sent_timestamp[0], (int, float)) else start_ms / 1000.0
+                                    sent_end = sent_timestamp[1] / 1000.0 if isinstance(sent_timestamp[1], (int, float)) else end_ms / 1000.0
+                                else:
+                                    # 如果没有时间戳，使用VAD段的时间，但按句子比例分配
+                                    sent_start = start_ms / 1000.0
+                                    sent_end = end_ms / 1000.0 if end_ms != -1 else 999999
+                                
+                                segment_results.append({
+                                    "start_time": round(sent_start, 2),
+                                    "end_time": round(sent_end, 2),
+                                    "text": sent_text,
+                                    "segment_idx": idx,
+                                    "_audio_data": segment_audio_data[idx]  # 缓存音频数据供步骤3使用
+                                })
+                                full_text_parts.append(sent_text)
+                        elif timestamp and len(timestamp) > 0:
+                            # 使用timestamp信息按句子切分
+                            # timestamp格式可能是 [[start, end, word], ...] 或 [[start, end], ...]
+                            current_sentence = []
+                            current_start = None
+                            current_end = None
+                            
+                            for ts_item in timestamp:
+                                if not isinstance(ts_item, list) or len(ts_item) < 2:
+                                    continue
+                                
+                                ts_start = ts_item[0] / 1000.0 if isinstance(ts_item[0], (int, float)) else start_ms / 1000.0
+                                ts_end = ts_item[1] / 1000.0 if isinstance(ts_item[1], (int, float)) else end_ms / 1000.0
+                                word = ts_item[-1] if len(ts_item) > 2 else ""
+                                
+                                if current_start is None:
+                                    current_start = ts_start
+                                
+                                current_sentence.append(word)
+                                current_end = ts_end
+                                
+                                # 遇到标点符号或停顿超过0.5秒，分句
+                                if word in ["。", "？", "！", ".", "?", "!"] or (len(current_sentence) > 1 and ts_start - current_end > 0.5):
+                                    sent_text = "".join(current_sentence).strip()
+                                    if sent_text and len(sent_text) >= 2:  # 过滤太短的句子
+                                        segment_results.append({
+                                            "start_time": round(current_start, 2),
+                                            "end_time": round(current_end, 2),
+                                            "text": sent_text,
+                                            "segment_idx": idx,
+                                            "_audio_data": segment_audio_data[idx]
+                                        })
+                                        full_text_parts.append(sent_text)
+                                    current_sentence = []
+                                    current_start = None
+                            
+                            # 处理最后一句
+                            if current_sentence:
+                                sent_text = "".join(current_sentence).strip()
+                                if sent_text and len(sent_text) >= 2:
+                                    segment_results.append({
+                                        "start_time": round(current_start, 2),
+                                        "end_time": round(current_end, 2),
+                                        "text": sent_text,
+                                        "segment_idx": idx,
+                                        "_audio_data": segment_audio_data[idx]
+                                    })
+                                    full_text_parts.append(sent_text)
+                        else:
+                            # 没有句子级别信息，按标点符号切分文本
+                            # 过滤太短的文本（少于3个字）
+                            if len(text) < 3:
+                                continue
+                            
+                            # 按标点符号切分
+                            sentences = re.split(r'([。！？\n])', text)
+                            current_sent = ""
+                            sent_start = start_ms / 1000.0
+                            segment_duration = (end_ms - start_ms) / 1000.0 if end_ms != -1 else 1.0
+                            char_duration = segment_duration / max(len(text), 1)
+                            
+                            for part in sentences:
+                                if not part.strip():
+                                    continue
+                                
+                                if part in ["。", "！", "？", "\n"]:
+                                    if current_sent.strip() and len(current_sent.strip()) >= 2:
+                                        sent_end = sent_start + len(current_sent) * char_duration
+                                        segment_results.append({
+                                            "start_time": round(sent_start, 2),
+                                            "end_time": round(sent_end, 2),
+                                            "text": current_sent.strip(),
+                                            "segment_idx": idx,
+                                            "_audio_data": segment_audio_data[idx]
+                                        })
+                                        full_text_parts.append(current_sent.strip())
+                                    sent_start = sent_end
+                                    current_sent = ""
+                                else:
+                                    current_sent += part
+                            
+                            # 处理最后一句
+                            if current_sent.strip() and len(current_sent.strip()) >= 2:
+                                sent_end = sent_start + len(current_sent) * char_duration
+                                segment_results.append({
+                                    "start_time": round(sent_start, 2),
+                                    "end_time": round(sent_end, 2),
+                                    "text": current_sent.strip(),
+                                    "segment_idx": idx,
+                                    "_audio_data": segment_audio_data[idx]
+                                })
+                                full_text_parts.append(current_sent.strip())
+                
             except Exception as e:
-                logger.warning(f"⚠️ 识别片段 {idx} 失败: {e}")
-                continue
+                logger.warning(f"⚠️ 批量识别失败: {e}，降级为单段识别")
+                # 降级：单段识别
+                for idx, (start_ms, end_ms) in batch_metadata:
+                    audio_data, sample_rate = segment_audio_data[idx]
+                    temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
+                    temp_segment.close()
+                    temp_segment_path = temp_segment.name
+                    sf.write(temp_segment_path, audio_data, sample_rate)
+                    
+                    try:
+                        seg_res = asr_model.generate(
+                            input=temp_segment_path,
+                            language="zh",
+                            use_itn=True
+                        )
+                        
+                        if seg_res and len(seg_res) > 0:
+                            text = seg_res[0].get("text", "").strip()
+                            text = re.sub(r'<\|[^|]+\|>', '', text).strip()
+                            
+                        # 降级处理：按标点符号切分
+                        if len(text) < 3:
+                            continue
+                        
+                        # 按标点符号切分
+                        sentences = re.split(r'([。！？\n])', text)
+                        current_sent = ""
+                        sent_start = start_ms / 1000.0
+                        segment_duration = (end_ms - start_ms) / 1000.0 if end_ms != -1 else 1.0
+                        char_duration = segment_duration / max(len(text), 1)
+                        
+                        for part in sentences:
+                            if not part.strip():
+                                continue
+                            
+                            if part in ["。", "！", "？", "\n"]:
+                                if current_sent.strip() and len(current_sent.strip()) >= 2:
+                                    sent_end = sent_start + len(current_sent) * char_duration
+                                    segment_results.append({
+                                        "start_time": round(sent_start, 2),
+                                        "end_time": round(sent_end, 2),
+                                        "text": current_sent.strip(),
+                                        "segment_idx": idx,
+                                        "_audio_data": segment_audio_data[idx]
+                                    })
+                                    full_text_parts.append(current_sent.strip())
+                                sent_start = sent_end
+                                current_sent = ""
+                            else:
+                                current_sent += part
+                        
+                        # 处理最后一句
+                        if current_sent.strip() and len(current_sent.strip()) >= 2:
+                            sent_end = sent_start + len(current_sent) * char_duration
+                            segment_results.append({
+                                "start_time": round(sent_start, 2),
+                                "end_time": round(sent_end, 2),
+                                "text": current_sent.strip(),
+                                "segment_idx": idx,
+                                "_audio_data": segment_audio_data[idx]
+                            })
+                            full_text_parts.append(current_sent.strip())
+                    except Exception as e2:
+                        logger.warning(f"⚠️ 识别片段 {idx} 失败: {e2}")
+                    finally:
+                        try:
+                            os.remove(temp_segment_path)
+                        except:
+                            pass
+            
+            finally:
+                # 清理批量临时文件
+                for temp_file in batch_files:
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
         
         full_text = "".join(full_text_parts)
         logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段，文本长度: {len(full_text)} 字")
         
-        # ===== 步骤3：为每个 VAD 段提取声纹并聚类 =====
-        logger.info("🎤 步骤3: 说话人分离...")
+        # ===== 步骤3：说话人分离（优化：复用步骤2的音频数据）=====
+        logger.info("🎤 步骤3: 说话人分离（优化：复用缓存音频）...")
         
-        # 调用说话人分离函数
-        from speaker_diarization import perform_speaker_diarization_with_vad
+        # 优化2: 复用步骤2提取的音频数据，避免重复提取
+        from speaker_diarization import perform_speaker_diarization_with_cached_audio
         
-        speaker_info = perform_speaker_diarization_with_vad(
-            audio_path=audio_file_path,
+        # 构建缓存的音频数据映射
+        cached_audio_map = {
+            result['segment_idx']: result.get('_audio_data')
+            for result in segment_results
+            if '_audio_data' in result
+        }
+        
+        # 调用优化后的说话人分离函数（使用缓存的音频数据）
+        speaker_info = perform_speaker_diarization_with_cached_audio(
             vad_segments=vad_segments,
+            cached_audio_map=cached_audio_map,
             speaker_model=speaker_model,
-            device=DEVICE
+            device=DEVICE,
+            audio_file_path=audio_file_path  # 降级时使用原始文件
         )
         
         # 将说话人信息合并到识别结果
@@ -447,6 +713,8 @@ async def transcribe(
         for item in transcript:
             if 'segment_idx' in item:
                 del item['segment_idx']
+            if '_audio_data' in item:
+                del item['_audio_data']  # 清理缓存的音频数据
         
         logger.info(f"✅ 最终结果: {len(transcript)} 个片段, {len(set(t['speaker_id'] for t in transcript))} 个说话人")
         

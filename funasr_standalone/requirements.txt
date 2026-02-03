@@ -21,6 +21,7 @@ numpy>=1.24.0
 scikit-learn>=1.3.0
 simplejson>=3.19.0  # modelscope 依赖
 sortedcontainers>=2.4.0  # modelscope/chromadb 依赖
+soundfile>=0.12.0  # 音频内存处理（优化）
 
 # ChromaDB 声纹库
 chromadb==0.5.0
