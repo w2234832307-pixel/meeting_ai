@@ -23,7 +23,7 @@ def perform_speaker_diarization_with_vad(
     speaker_model,
     device: str = "cuda",
     min_segment_duration: float = 1.0,
-    distance_threshold: float = 0.5
+    distance_threshold: float = 0.3  # 降低默认阈值，确保能识别出多个说话人
 ) -> List[Dict]:
     """
     基于 VAD 分段进行说话人分离
@@ -128,14 +128,21 @@ def perform_speaker_diarization_with_vad(
         
         logger.debug(f"✅ 声纹向量形状: {embeddings_array.shape}")
         
-        # 优化聚类参数：减少说话人数量（12个太多，通常会议3-5人）
-        # 自动调整距离阈值：如果片段很多，增大阈值以减少说话人数量
-        if len(embeddings) > 30:
-            # 片段很多，增大阈值，减少说话人数量
-            adjusted_threshold = min(0.7, distance_threshold + 0.1)
+        # 优化聚类参数：降低阈值，确保能识别出多个说话人
+        # 如果只识别出1个说话人，说明阈值太高，需要降低
+        # 自动调整距离阈值：根据片段数量动态调整
+        if len(embeddings) > 100:
+            # 片段很多，稍微增大阈值（但不要太大，避免只识别出1个人）
+            adjusted_threshold = min(0.6, distance_threshold + 0.05)
             logger.info(f"🔧 片段较多({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
+        elif len(embeddings) > 50:
+            # 片段中等，保持或稍微降低阈值
+            adjusted_threshold = max(0.3, distance_threshold - 0.05)
+            logger.info(f"🔧 片段中等({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
         else:
-            adjusted_threshold = distance_threshold
+            # 片段较少，降低阈值，确保能识别出多个说话人
+            adjusted_threshold = max(0.25, distance_threshold - 0.1)
+            logger.info(f"🔧 片段较少({len(embeddings)}个)，降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
         
         clustering = AgglomerativeClustering(
             n_clusters=None,

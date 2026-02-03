@@ -264,6 +264,80 @@ async def transcribe(
         
         logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
         
+        # ===== 优化：合并相邻短片段，避免过度分段 =====
+        if len(vad_segments) > 50:  # 如果片段太多，进行合并
+            logger.info(f"🔧 VAD分段过多({len(vad_segments)}个)，开始合并短片段...")
+            merged_segments = []
+            current_segment = None
+            
+            MIN_SEGMENT_DURATION_MS = 3000  # 最小片段时长3秒
+            MAX_GAP_MS = 1000  # 最大间隔1秒（超过1秒不合并）
+            
+            for segment in vad_segments:
+                if not isinstance(segment, list) or len(segment) < 2:
+                    continue
+                
+                start_ms, end_ms = segment[0], segment[1]
+                
+                if end_ms == -1:
+                    # 最后一个片段，直接添加
+                    if current_segment:
+                        merged_segments.append(current_segment)
+                        current_segment = None
+                    merged_segments.append(segment)
+                    continue
+                
+                duration_ms = end_ms - start_ms
+                
+                if current_segment is None:
+                    # 第一个片段
+                    if duration_ms >= MIN_SEGMENT_DURATION_MS:
+                        merged_segments.append(segment)
+                    else:
+                        current_segment = segment  # 暂存，等待合并
+                else:
+                    # 检查是否可以合并
+                    prev_end = current_segment[1]
+                    gap_ms = start_ms - prev_end
+                    
+                    if gap_ms <= MAX_GAP_MS:
+                        # 间隔小，可以合并
+                        current_segment[1] = end_ms
+                        merged_duration = current_segment[1] - current_segment[0]
+                        
+                        # 如果合并后达到最小长度，添加到结果
+                        if merged_duration >= MIN_SEGMENT_DURATION_MS:
+                            merged_segments.append(current_segment)
+                            current_segment = None
+                    else:
+                        # 间隔大，不能合并
+                        # 先处理之前的片段
+                        if current_segment[1] != -1:
+                            prev_duration = current_segment[1] - current_segment[0]
+                            if prev_duration >= MIN_SEGMENT_DURATION_MS:
+                                merged_segments.append(current_segment)
+                            else:
+                                # 太短，丢弃或与下一个合并
+                                pass
+                        
+                        # 处理当前片段
+                        if duration_ms >= MIN_SEGMENT_DURATION_MS:
+                            merged_segments.append(segment)
+                            current_segment = None
+                        else:
+                            current_segment = segment
+            
+            # 处理最后一个暂存的片段
+            if current_segment:
+                merged_duration = current_segment[1] - current_segment[0] if current_segment[1] != -1 else 999999
+                if merged_duration >= MIN_SEGMENT_DURATION_MS:
+                    merged_segments.append(current_segment)
+            
+            original_count = len(vad_segments)
+            original_count = len(vad_segments)
+            vad_segments = merged_segments
+            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个）")
+        
         # ===== 步骤2：批量提取片段并识别（优化：批量处理 + 内存缓存）=====
         logger.info("🎤 步骤2: SenseVoiceSmall 批量识别（优化版）...")
         
@@ -633,6 +707,8 @@ async def transcribe(
             cached_audio_map=cached_audio_map,
             speaker_model=speaker_model,
             device=DEVICE,
+            min_segment_duration=1.0,  # 最小片段时长1秒
+            distance_threshold=0.3,  # 降低阈值，确保能识别出多个说话人（默认0.5太高）
             audio_file_path=audio_file_path  # 降级时使用原始文件
         )
         
@@ -881,7 +957,7 @@ async def transcribe(
             if voice_matcher and voice_matcher.enabled and transcript and temp_file_path:
                 logger.info("🎙️ 开始声纹匹配...")
                 
-                # 1. 为每个说话人提取音频片段
+                # 1. 为每个说话人提取音频片段（每个speaker_id只提取一次）
                 speaker_segments = voice_matcher.extract_speaker_segments(
                     audio_path=str(temp_file_path),
                     transcript=transcript,
@@ -889,9 +965,9 @@ async def transcribe(
                 )
                 
                 if speaker_segments:
-                    logger.info(f"✅ 提取到 {len(speaker_segments)} 个说话人的音频片段")
+                    logger.info(f"✅ 提取到 {len(speaker_segments)} 个说话人的音频片段（每个speaker_id只提取一次）")
                     
-                    # 2. 匹配说话人身份
+                    # 2. 匹配说话人身份（每个speaker_id只匹配一次）
                     matched = voice_matcher.match_speakers(
                         speaker_segments=speaker_segments,
                         threshold=0.75  # 相似度阈值75%
