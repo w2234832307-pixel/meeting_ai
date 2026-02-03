@@ -58,8 +58,8 @@ def perform_speaker_diarization_with_vad(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 过滤太短的片段
-            if duration < min_segment_duration:
+            # 过滤太短的片段（但降低阈值，避免过滤太多导致只识别出1个人）
+            if duration < max(0.5, min_segment_duration * 0.5):  # 降低过滤阈值，至少0.5秒
                 logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s")
                 continue
             
@@ -128,21 +128,26 @@ def perform_speaker_diarization_with_vad(
         
         logger.debug(f"✅ 声纹向量形状: {embeddings_array.shape}")
         
-        # 优化聚类参数：降低阈值，确保能识别出多个说话人
-        # 如果只识别出1个说话人，说明阈值太高，需要降低
-        # 自动调整距离阈值：根据片段数量动态调整
+        # 优化聚类参数：大幅降低阈值，确保能识别出多个说话人
+        # 如果只识别出1个说话人，说明阈值太高，需要大幅降低
+        # 自动调整距离阈值：根据片段数量动态调整，但始终偏向识别更多说话人
         if len(embeddings) > 100:
-            # 片段很多，稍微增大阈值（但不要太大，避免只识别出1个人）
-            adjusted_threshold = min(0.6, distance_threshold + 0.05)
+            # 片段很多，使用中等阈值（不要太大，避免只识别出1个人）
+            adjusted_threshold = min(0.5, distance_threshold)  # 最多0.5，不要超过
             logger.info(f"🔧 片段较多({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
-        elif len(embeddings) > 50:
-            # 片段中等，保持或稍微降低阈值
-            adjusted_threshold = max(0.3, distance_threshold - 0.05)
-            logger.info(f"🔧 片段中等({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
-        else:
-            # 片段较少，降低阈值，确保能识别出多个说话人
+        elif len(embeddings) > 30:
+            # 片段中等，降低阈值，确保识别多个说话人
             adjusted_threshold = max(0.25, distance_threshold - 0.1)
-            logger.info(f"🔧 片段较少({len(embeddings)}个)，降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
+            logger.info(f"🔧 片段中等({len(embeddings)}个)，降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
+        else:
+            # 片段较少，大幅降低阈值，确保能识别出多个说话人
+            adjusted_threshold = max(0.2, distance_threshold - 0.15)  # 最低0.2
+            logger.info(f"🔧 片段较少({len(embeddings)}个)，大幅降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
+        
+        # 额外检查：如果阈值仍然太高，强制降低
+        if adjusted_threshold > 0.4:
+            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.35")
+            adjusted_threshold = 0.35
         
         clustering = AgglomerativeClustering(
             n_clusters=None,
@@ -207,7 +212,7 @@ def perform_speaker_diarization_with_cached_audio(
     speaker_model,
     device: str = "cuda",
     min_segment_duration: float = 1.0,
-    distance_threshold: float = 0.5,
+    distance_threshold: float = 0.3,  # 降低默认阈值，确保能识别出多个说话人
     audio_file_path: str = None
 ) -> List[Dict]:
     """
@@ -249,8 +254,8 @@ def perform_speaker_diarization_with_cached_audio(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 过滤太短的片段
-            if duration < min_segment_duration:
+            # 过滤太短的片段（但降低阈值，避免过滤太多导致只识别出1个人）
+            if duration < max(0.5, min_segment_duration * 0.5):  # 降低过滤阈值，至少0.5秒
                 logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s")
                 return None, None
             
@@ -365,12 +370,26 @@ def perform_speaker_diarization_with_cached_audio(
         
         logger.debug(f"✅ 声纹向量形状: {embeddings_array.shape}")
         
-        # 自动调整距离阈值
-        if len(embeddings) > 30:
-            adjusted_threshold = min(0.7, distance_threshold + 0.1)
+        # 优化聚类参数：大幅降低阈值，确保能识别出多个说话人
+        # 如果只识别出1个说话人，说明阈值太高，需要大幅降低
+        # 自动调整距离阈值：根据片段数量动态调整，但始终偏向识别更多说话人
+        if len(embeddings) > 100:
+            # 片段很多，使用中等阈值（不要太大，避免只识别出1个人）
+            adjusted_threshold = min(0.5, distance_threshold)  # 最多0.5，不要超过
             logger.info(f"🔧 片段较多({len(embeddings)}个)，调整聚类阈值为 {adjusted_threshold:.2f}")
+        elif len(embeddings) > 30:
+            # 片段中等，降低阈值，确保识别多个说话人
+            adjusted_threshold = max(0.25, distance_threshold - 0.1)
+            logger.info(f"🔧 片段中等({len(embeddings)}个)，降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
         else:
-            adjusted_threshold = distance_threshold
+            # 片段较少，大幅降低阈值，确保能识别出多个说话人
+            adjusted_threshold = max(0.2, distance_threshold - 0.15)  # 最低0.2
+            logger.info(f"🔧 片段较少({len(embeddings)}个)，大幅降低聚类阈值为 {adjusted_threshold:.2f} 以识别更多说话人")
+        
+        # 额外检查：如果阈值仍然太高，强制降低
+        if adjusted_threshold > 0.4:
+            logger.warning(f"⚠️ 聚类阈值 {adjusted_threshold:.2f} 可能过高，强制降低到 0.35")
+            adjusted_threshold = 0.35
         
         clustering = AgglomerativeClustering(
             n_clusters=None,

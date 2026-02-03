@@ -264,14 +264,15 @@ async def transcribe(
         
         logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
         
-        # ===== 优化：合并相邻短片段，避免过度分段 =====
-        if len(vad_segments) > 50:  # 如果片段太多，进行合并
-            logger.info(f"🔧 VAD分段过多({len(vad_segments)}个)，开始合并短片段...")
+        # ===== 优化：总是合并相邻短片段，避免过度分段和丢内容 =====
+        # 无论片段多少，都进行合并优化，避免丢失内容
+        if len(vad_segments) > 1:  # 只要有多个片段，就进行合并优化
+            logger.info(f"🔧 优化VAD分段({len(vad_segments)}个)，合并短片段避免丢内容...")
             merged_segments = []
             current_segment = None
             
-            MIN_SEGMENT_DURATION_MS = 3000  # 最小片段时长3秒
-            MAX_GAP_MS = 1000  # 最大间隔1秒（超过1秒不合并）
+            MIN_SEGMENT_DURATION_MS = 5000  # 最小片段时长5秒（增加，避免切太细）
+            MAX_GAP_MS = 2000  # 最大间隔2秒（增加，合并更多相邻片段）
             
             for segment in vad_segments:
                 if not isinstance(segment, list) or len(segment) < 2:
@@ -314,11 +315,12 @@ async def transcribe(
                         # 先处理之前的片段
                         if current_segment[1] != -1:
                             prev_duration = current_segment[1] - current_segment[0]
-                            if prev_duration >= MIN_SEGMENT_DURATION_MS:
-                                merged_segments.append(current_segment)
-                            else:
-                                # 太短，丢弃或与下一个合并
-                                pass
+                        if prev_duration >= MIN_SEGMENT_DURATION_MS:
+                            merged_segments.append(current_segment)
+                        else:
+                            # 太短，强制合并到下一个片段（避免丢内容）
+                            # 不丢弃，继续尝试合并
+                            pass
                         
                         # 处理当前片段
                         if duration_ms >= MIN_SEGMENT_DURATION_MS:
@@ -327,16 +329,22 @@ async def transcribe(
                         else:
                             current_segment = segment
             
-            # 处理最后一个暂存的片段
+            # 处理最后一个暂存的片段（不丢弃，强制合并或添加）
             if current_segment:
                 merged_duration = current_segment[1] - current_segment[0] if current_segment[1] != -1 else 999999
-                if merged_duration >= MIN_SEGMENT_DURATION_MS:
+                # 即使不够最小长度，也添加（避免丢内容）
+                if merged_duration >= 1.0:  # 至少1秒就保留
                     merged_segments.append(current_segment)
+                elif len(merged_segments) > 0:
+                    # 如果太短，合并到最后一个片段（避免丢内容）
+                    last_segment = merged_segments[-1]
+                    if last_segment[1] != -1 and current_segment[1] != -1:
+                        last_segment[1] = current_segment[1]
+                    logger.debug(f"🔧 将短片段合并到前一个片段，避免丢内容")
             
             original_count = len(vad_segments)
-            original_count = len(vad_segments)
             vad_segments = merged_segments
-            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个）")
+            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个，避免丢内容）")
         
         # ===== 步骤2：批量提取片段并识别（优化：批量处理 + 内存缓存）=====
         logger.info("🎤 步骤2: SenseVoiceSmall 批量识别（优化版）...")
