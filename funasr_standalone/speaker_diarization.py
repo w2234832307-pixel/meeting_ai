@@ -58,9 +58,11 @@ def perform_speaker_diarization_with_vad(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 过滤太短的片段（但降低阈值，避免过滤太多导致只识别出1个人）
-            if duration < max(0.5, min_segment_duration * 0.5):  # 降低过滤阈值，至少0.5秒
-                logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s")
+            # 提高声纹提取质量：要求更长的片段（至少3秒，确保声纹质量）
+            # 短片段声纹质量差，会导致聚类不准确
+            MIN_EMBEDDING_DURATION = 3.0  # 至少3秒，确保声纹质量
+            if duration < MIN_EMBEDDING_DURATION:
+                logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s (需要至少{MIN_EMBEDDING_DURATION}秒以确保声纹质量)")
                 continue
             
             # 提取音频片段并获取声纹
@@ -154,11 +156,27 @@ def perform_speaker_diarization_with_vad(
             logger.warning(f"⚠️ 片段较多({len(embeddings)}个)但阈值{adjusted_threshold:.2f}可能过高，强制降低到 0.2")
             adjusted_threshold = 0.2
         
+        # 优化聚类算法：尝试不同的linkage方法
+        # 'ward': 最小方差法，适合欧氏距离（但这里用cosine，可能不是最优）
+        # 'complete': 最大距离法，更保守，能识别更多说话人
+        # 'average': 平均距离法，平衡（当前使用）
+        # 'single': 最小距离法，可能过度合并
+        
+        # 根据片段数量选择最优的linkage方法
+        if len(embeddings) > 50:
+            # 片段多，使用更保守的complete方法，避免过度合并
+            linkage_method = 'complete'
+            logger.info(f"🔧 片段较多，使用 'complete' linkage方法（更保守，识别更多说话人）")
+        else:
+            # 片段少，使用average方法（平衡）
+            linkage_method = 'average'
+            logger.info(f"🔧 片段较少，使用 'average' linkage方法（平衡）")
+        
         clustering = AgglomerativeClustering(
             n_clusters=None,
             distance_threshold=adjusted_threshold,  # 调整后的距离阈值
             metric='cosine',
-            linkage='average'
+            linkage=linkage_method  # 动态选择linkage方法
         )
         
         cluster_labels = clustering.fit_predict(embeddings_array)
@@ -259,9 +277,11 @@ def perform_speaker_diarization_with_cached_audio(
             else:
                 duration = (end_ms - start_ms) / 1000.0
             
-            # 过滤太短的片段（但降低阈值，避免过滤太多导致只识别出1个人）
-            if duration < max(0.5, min_segment_duration * 0.5):  # 降低过滤阈值，至少0.5秒
-                logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s")
+            # 提高声纹提取质量：要求更长的片段（至少3秒，确保声纹质量）
+            # 短片段声纹质量差，会导致聚类不准确
+            MIN_EMBEDDING_DURATION = 3.0  # 至少3秒，确保声纹质量
+            if duration < MIN_EMBEDDING_DURATION:
+                logger.debug(f"⏭️ 跳过过短片段 {idx}: {duration:.2f}s (需要至少{MIN_EMBEDDING_DURATION}秒以确保声纹质量)")
                 return None, None
             
             # 优先使用缓存的音频数据
