@@ -2,11 +2,52 @@
 声纹匹配服务
 用于将ASR识别的speaker_id映射到真实员工姓名
 """
+# 修复 datasets 兼容性问题（必须在导入 modelscope 之前）
+def _fix_datasets_compatibility():
+    """修复 datasets 与 modelscope 的兼容性问题"""
+    try:
+        import datasets
+        
+        # 修复 LargeList 导入
+        if not hasattr(datasets, 'LargeList'):
+            try:
+                from datasets import LargeList
+            except ImportError:
+                try:
+                    import pyarrow as pa
+                    if hasattr(pa, 'large_list'):
+                        datasets.LargeList = pa.large_list
+                    elif hasattr(pa, 'LargeList'):
+                        datasets.LargeList = pa.LargeList
+                except Exception:
+                    pass
+        
+        # 修复 _FEATURE_TYPES 导入（datasets 2.19+ 中可能已移除）
+        try:
+            from datasets.features.features import _FEATURE_TYPES
+        except ImportError:
+            try:
+                # 尝试从新位置导入
+                from datasets.features import _FEATURE_TYPES
+            except ImportError:
+                try:
+                    # 如果不存在，创建一个兼容的占位符
+                    import datasets.features.features as features_module
+                    if not hasattr(features_module, '_FEATURE_TYPES'):
+                        # 创建一个空的字典作为占位符
+                        features_module._FEATURE_TYPES = {}
+                except Exception:
+                    pass
+    except Exception:
+        pass  # 如果 datasets 都导入不了，让后续代码自己处理错误
+
+# 立即执行修复
+_fix_datasets_compatibility()
+
 import logging
 import chromadb
 import torch
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
+from funasr import AutoModel
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import subprocess
@@ -22,7 +63,7 @@ class VoiceMatcher:
     def __init__(self, 
                  chroma_host: str = "192.168.211.74",
                  chroma_port: int = 8000,
-                 collection_name: str = "employee_voice_library",
+                 collection_name: str = "employee_voice_voiceprint",
                  device: str = None):
         """
         初始化声纹匹配器
@@ -44,15 +85,14 @@ class VoiceMatcher:
             
             logger.info(f"🎙️ 正在初始化声纹匹配器... (设备: {self.device})")
             
-            # 加载Cam++声纹模型
-            logger.info("📦 加载 Cam++ 声纹模型...")
-            self.embedding_model = pipeline(
-                task=Tasks.speaker_verification,
-                model='iic/speech_campplus_sv_zh-cn_16k-common',
-                model_revision='v1.0.0',
-                device=self.device
+            # 加载Cam++声纹模型（使用 FunASR AutoModel，直接输出 spk_embedding 向量）
+            logger.info("📦 加载 Cam++ 声纹模型 (FunASR AutoModel)...")
+            self.embedding_model = AutoModel(
+                model="iic/speech_campplus_sv_zh-cn_16k-common",
+                device=self.device,
+                disable_update=True
             )
-            logger.info("✅ 声纹模型加载成功")
+            logger.info("✅ 声纹模型加载成功（支持输出 spk_embedding）")
             
             # 连接ChromaDB
             logger.info(f"🔌 连接 ChromaDB: {chroma_host}:{chroma_port}")
@@ -61,24 +101,48 @@ class VoiceMatcher:
                 port=chroma_port
             )
             
-            # 获取声纹库集合
+            # 获取/创建专用的声纹库集合（Cam++，192维），与文本向量库完全隔离
+            CAMPP_DIM = 192
+            logger.info(f"🔌 连接声纹库集合: {collection_name} (期望维度: {CAMPP_DIM})")
             self.collection = self.client.get_or_create_collection(
                 name=collection_name,
-                metadata={"hnsw:space": "cosine"}
+                metadata={
+                    "hnsw:space": "cosine",
+                    "embedding_dimension": CAMPP_DIM,
+                    "model": "cam++"
+                }
             )
-            logger.info(f"✅ 连接声纹库成功: {collection_name}")
             
             # 检查声纹库是否为空
             count = self.collection.count()
             if count == 0:
-                logger.warning("⚠️ 声纹库为空，声纹识别将被禁用")
+                logger.warning("⚠️ 声纹库为空，声纹识别将被禁用（请先录入员工声纹）")
                 self.enabled = False
             else:
-                logger.info(f"✅ 声纹库已就绪，共 {count} 个员工声纹")
+                logger.info(f"✅ 声纹库已就绪，共 {count} 个员工声纹（192维 Cam++）")
                 self.enabled = True
             
         except Exception as e:
-            logger.error(f"❌ 声纹匹配器初始化失败: {e}")
+            error_msg = str(e)
+            logger.error(f"❌ 声纹匹配器初始化失败: {error_msg}")
+            
+            # 根据错误类型给出具体的修复建议
+            if "simplejson" in error_msg or "No module named 'simplejson'" in error_msg:
+                logger.error("   💡 缺少依赖: simplejson")
+                logger.error("   📦 解决方案: pip install simplejson")
+            elif "sortedcontainers" in error_msg or "No module named 'sortedcontainers'" in error_msg:
+                logger.error("   💡 缺少依赖: sortedcontainers")
+                logger.error("   📦 解决方案: pip install sortedcontainers")
+            elif "chromadb" in error_msg.lower() or "连接" in error_msg or "refused" in error_msg.lower():
+                logger.error("   💡 ChromaDB 连接失败")
+                logger.error("   📦 解决方案: 检查 ChromaDB 服务是否启动")
+                logger.error("      启动命令: docker run -d --name chromadb -p 8000:8000 chromadb/chroma:latest")
+            elif "datasets" in error_msg.lower() or "LargeList" in error_msg or "_FEATURE_TYPES" in error_msg:
+                logger.error("   💡 datasets 版本兼容性问题")
+                logger.error("   📦 解决方案: pip install 'datasets==2.17.0'")
+            else:
+                logger.error("   💡 请查看上方错误信息，根据错误类型修复")
+            
             logger.warning("⚠️ 声纹识别功能将被禁用，将使用默认speaker_id")
             self.enabled = False
     
@@ -194,7 +258,13 @@ class VoiceMatcher:
             ]
             
             subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-            return str(output_path)
+            
+            # 确保文件存在并返回绝对路径
+            if output_path.exists():
+                return str(output_path.resolve())
+            else:
+                logger.error(f"❌ 提取的音频文件不存在: {output_path}")
+                return None
             
         except FileNotFoundError:
             logger.error("❌ ffmpeg 未安装，无法提取音频片段")
@@ -281,22 +351,66 @@ class VoiceMatcher:
             声纹向量（192维），失败返回None
         """
         try:
-            res = self.embedding_model(audio_path)
+            # 确保路径是绝对路径字符串（Windows路径处理）
+            original_path = audio_path
+            logger.debug(f"🔍 _extract_vector 输入: {original_path}, 类型: {type(original_path)}")
             
-            if res and 'spk_embedding' in res:
-                vector = res['spk_embedding']
-                
-                # 转换为Python list
-                if hasattr(vector, 'tolist'):
-                    vector = vector.tolist()
-                
-                return vector
+            if isinstance(audio_path, Path):
+                audio_path = str(audio_path.resolve())
             else:
-                logger.error(f"❌ 模型未返回 spk_embedding: {res}")
+                audio_path = str(Path(audio_path).resolve())
+            
+            logger.debug(f"🔍 处理后路径: {audio_path}")
+            
+            # 检查文件是否存在
+            if not os.path.exists(audio_path):
+                logger.error(f"❌ 音频文件不存在: {audio_path}")
+                logger.error(f"   原始路径: {original_path}")
+                logger.error(f"   路径类型: {type(original_path)}")
+                return None
+            
+            logger.info(f"🔍 提取声纹向量: {audio_path}")
+            logger.debug(f"   路径类型: {type(audio_path)}, 路径值: {repr(audio_path)}")
+            
+            try:
+                # 使用 FunASR AutoModel 提取声纹向量
+                # 与说话人分离模块保持一致：generate(input=audio_path)，返回列表，每个元素含 spk_embedding
+                emb_res = self.embedding_model.generate(input=audio_path)
+                logger.debug(f"   模型返回类型: {type(emb_res)}, 内容概要: {emb_res}")
+                
+                if not emb_res or len(emb_res) == 0:
+                    logger.error("❌ 声纹模型未返回结果")
+                    return None
+                
+                emb = emb_res[0].get("spk_embedding", None)
+                if emb is None:
+                    logger.error(f"❌ 模型未返回 spk_embedding，返回键: {list(emb_res[0].keys())}")
+                    return None
+                
+                # 转为 numpy / list，并确保是一维向量
+                import numpy as np
+                emb_array = np.array(emb)
+                if emb_array.ndim > 1:
+                    emb_array = emb_array.flatten()
+                
+                vector = emb_array.tolist()
+                logger.debug(f"   ✅ 成功提取声纹向量，维度: {len(vector)}")
+                return vector
+            
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"❌ 声纹向量提取失败: {error_msg}")
+                import traceback
+                logger.debug(f"   详细错误: {traceback.format_exc()}")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ 提取声纹向量异常: {e}")
+            error_msg = str(e)
+            logger.error(f"❌ 提取声纹向量异常: {error_msg}")
+            logger.error(f"   音频路径: {audio_path if 'audio_path' in locals() else '未知'}")
+            logger.error(f"   路径类型: {type(audio_path) if 'audio_path' in locals() else '未知'}")
+            import traceback
+            logger.debug(f"   详细错误: {traceback.format_exc()}")
             return None
     
     def replace_speaker_ids(self,

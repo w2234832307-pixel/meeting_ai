@@ -5,6 +5,50 @@ FunASR 独立服务 - 生产级配置
 端口: 8002
 功能: CPU量化加速 + 自动日志记录
 """
+# =============================================
+# 0. 修复 datasets 兼容性问题（必须在导入其他模块之前）
+# =============================================
+def _fix_datasets_compatibility():
+    """修复 datasets 与 modelscope 的兼容性问题"""
+    try:
+        import datasets
+        
+        # 修复 LargeList 导入
+        if not hasattr(datasets, 'LargeList'):
+            try:
+                from datasets import LargeList
+            except ImportError:
+                try:
+                    import pyarrow as pa
+                    if hasattr(pa, 'large_list'):
+                        datasets.LargeList = pa.large_list
+                    elif hasattr(pa, 'LargeList'):
+                        datasets.LargeList = pa.LargeList
+                except Exception:
+                    pass
+        
+        # 修复 _FEATURE_TYPES 导入（datasets 2.19+ 中可能已移除）
+        try:
+            from datasets.features.features import _FEATURE_TYPES
+        except ImportError:
+            try:
+                # 尝试从新位置导入
+                from datasets.features import _FEATURE_TYPES
+            except ImportError:
+                try:
+                    # 如果不存在，创建一个兼容的占位符
+                    import datasets.features.features as features_module
+                    if not hasattr(features_module, '_FEATURE_TYPES'):
+                        # 创建一个空的字典作为占位符
+                        features_module._FEATURE_TYPES = {}
+                except Exception:
+                    pass
+    except Exception:
+        pass  # 如果 datasets 都导入不了，让后续代码自己处理错误
+
+# 立即执行修复
+_fix_datasets_compatibility()
+
 import os
 import sys
 import logging
@@ -374,20 +418,8 @@ async def transcribe(
         unique_speakers = sorted(all_speaker_ids, key=lambda x: first_occurrence[x])
         n_speakers = len(unique_speakers)
         
-        # 显示真实的识别结果（证明不是写死的）
-        logger.info(f"🎯 【真实识别结果】基于声纹聚类识别出 {n_speakers} 个不同的说话人")
-        logger.info(f"   原始说话人ID: {sorted(unique_speakers, key=int)}")
-        
-        # 统计每个说话人的片段数量（证明是真实识别）
-        speaker_counts = {}
-        for result in segment_results:
-            sid = result['speaker_id']
-            speaker_counts[sid] = speaker_counts.get(sid, 0) + 1
-        logger.info(f"   各说话人的片段数量: {dict(sorted(speaker_counts.items(), key=lambda x: int(x[0])))}")
-        
         # 重新映射：第一个出现的说话人 -> 0，第二个 -> 1...
         # 这只是编号规范化，不影响哪些片段属于哪个说话人
-        logger.info(f"🔧 编号规范化: {unique_speakers} -> 0-{n_speakers-1} (仅统一编号，不影响识别结果)")
         
         speaker_remap = {old_id: str(new_id) for new_id, old_id in enumerate(unique_speakers)}
         logger.debug(f"🔍 映射关系: {speaker_remap}")
@@ -574,6 +606,7 @@ async def transcribe(
         matched_info = {}
         try:
             # 延迟导入，避免启动时的依赖错误
+            # 注意：datasets 兼容性修复已在文件开头执行
             from voice_matcher import get_voice_matcher
             
             voice_matcher = get_voice_matcher()
@@ -629,7 +662,11 @@ async def transcribe(
             logger.warning(f"   错误详情: {e}")
             logger.warning(f"   如需使用声纹识别，请运行以下命令：")
             logger.warning(f"   pip install 'datasets>=2.14.0' 'chromadb==0.5.0'")
-            logger.warning(f"   注意：datasets 2.13.0 版本缺少 LargeList，需要升级到 2.14.0+")
+            logger.warning(f"   这是 datasets 版本兼容性问题，请尝试：")
+            logger.warning(f"   1. 使用兼容版本: pip install 'datasets==2.17.0' 或 'datasets==2.18.0'")
+            logger.warning(f"   2. 或升级 modelscope: pip install -U modelscope")
+            logger.warning(f"   3. 如果 flagembedding 需要 datasets>=2.19.0，考虑创建独立环境")
+            logger.warning(f"   注意：已尝试自动修补，但可能不够，建议使用兼容版本")
             matched_info = {}
         except Exception as e:
             logger.error(f"❌ 声纹匹配失败: {e}", exc_info=True)
