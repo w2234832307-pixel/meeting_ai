@@ -25,13 +25,7 @@ _pipeline_cache = None
 
 def get_pyannote_pipeline(use_auth_token: Optional[str] = None):
     """
-    获取 Pyannote pipeline（带缓存）
-    
-    Args:
-        use_auth_token: HuggingFace token
-    
-    Returns:
-        Pipeline 对象，失败返回 None
+    获取 Pyannote pipeline（优先使用离线配置）
     """
     global _pipeline_cache
     
@@ -45,60 +39,46 @@ def get_pyannote_pipeline(use_auth_token: Optional[str] = None):
         import os
         from pathlib import Path
         
-        hf_token = use_auth_token or os.getenv("HF_TOKEN")
-        
-        # 获取项目根目录
+        # 1. 确定离线配置文件的位置
+        # 路径结构: 项目根目录/models/pyannote_diarization/offline_config.yaml
         current_file = Path(__file__).resolve()
         project_root = current_file.parent.parent
-        local_model_path = project_root / "models" / "pyannote_diarization"
+        offline_config_path = project_root / "models" / "pyannote_diarization" / "offline_config.yaml"
         
-        pipeline = None
-        use_local_model = False
-        
-        # 检查本地模型
-        if local_model_path.exists() and (local_model_path / "config.yaml").exists():
-            logger.info(f"✅ 检测到项目本地模型: {local_model_path}")
-            
-            local_segmentation_path = project_root / "models" / "pyannote_segmentation"
-            local_embedding_path = project_root / "models" / "pyannote_wespeaker"
-            
-            has_local_segmentation = local_segmentation_path.exists() and (local_segmentation_path / "config.yaml").exists()
-            has_local_embedding = local_embedding_path.exists() and (local_embedding_path / "config.yaml").exists()
-            
-            if has_local_segmentation and has_local_embedding:
-                try:
-                    import yaml
-                    import shutil
-                    
-                    config_file = local_model_path / "config.yaml"
-                    with open(config_file, 'r', encoding='utf-8') as f:
-                        config = yaml.safe_load(f)
-                    
-                    if 'pipeline' in config and 'params' in config['pipeline']:
-                        config['pipeline']['params']['segmentation'] = str(local_segmentation_path.resolve())
-                        config['pipeline']['params']['embedding'] = str(local_embedding_path.resolve())
-                    
-                    temp_config_file = local_model_path / "config.yaml.local"
-                    with open(temp_config_file, 'w', encoding='utf-8') as f:
-                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-                    
-                    original_config_file = local_model_path / "config.yaml.original"
-                    if not original_config_file.exists():
-                        shutil.copy2(config_file, original_config_file)
-                    
-                    shutil.copy2(temp_config_file, config_file)
-                    
-                    try:
-                        pipeline = Pipeline.from_pretrained(str(local_model_path), local_files_only=True)
-                        logger.info("✅ 成功从项目本地路径加载 Pyannote 模型")
-                        use_local_model = True
-                    finally:
-                        if original_config_file.exists():
-                            shutil.copy2(original_config_file, config_file)
-                        if temp_config_file.exists():
-                            temp_config_file.unlink()
-                except Exception as e:
-                    logger.warning(f"⚠️ 从本地路径加载失败: {e}")
+        # 2. 尝试加载离线配置
+        if offline_config_path.exists():
+            logger.info(f"✅ 发现离线配置文件，准备加载: {offline_config_path}")
+            try:
+                # 核心修改：直接加载这个特定的 yaml 文件，而不是加载目录
+                pipeline = Pipeline.from_pretrained(str(offline_config_path))
+                
+                logger.info("✅ 成功加载 Pyannote 离线模型")
+                _pipeline_cache = pipeline
+                return pipeline
+            except Exception as e:
+                logger.error(f"❌ 离线配置文件加载失败: {e}")
+                # 如果离线加载失败，不要继续尝试联网了，直接抛出异常或返回 None
+                # 因为在服务器上联网尝试通常也会失败
+                return None
+
+        # 3. 如果找不到离线文件（备用方案：尝试从 HuggingFace 在线加载）
+        # 只有在开发环境（有网）且没下载模型时才会走到这一步
+        logger.warning("⚠️ 未找到 offline_config.yaml，尝试使用 HuggingFace 在线加载...")
+        hf_token = use_auth_token or os.getenv("HF_TOKEN")
+        if hf_token:
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+            _pipeline_cache = pipeline
+            return pipeline
+        else:
+            logger.error("❌ 既无离线配置，也无 HF_TOKEN，无法加载模型")
+            return None
+
+    except Exception as e:
+        logger.error(f"❌ Pyannote 初始化发生未知错误: {e}")
+        return None
         
         # 如果本地模型加载失败，尝试从 HuggingFace 加载
         if not use_local_model:
