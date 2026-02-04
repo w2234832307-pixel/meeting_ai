@@ -435,6 +435,9 @@ async def process_meeting_audio(
             funasr_service_url = os.getenv("FUNASR_SERVICE_URL", "")
             pyannote_service_url = os.getenv("PYANNOTE_SERVICE_URL", "")
             
+            # 详细日志：检查并行流程条件
+            logger.info(f"🔍 并行流程检查: FUNASR_SERVICE_URL={funasr_service_url}, PYANNOTE_SERVICE_URL={pyannote_service_url}, asr_model={asr_model}")
+            
             # 如果音频是 URL，先下载到临时文件
             temp_audio_file = None
             actual_audio_path = target_audio_path
@@ -463,6 +466,15 @@ async def process_meeting_audio(
             if funasr_service_url and pyannote_service_url and asr_model == "funasr":
                 use_parallel_flow = True
                 logger.info("🚀 使用新流程：并行处理 FunASR (字级别) + Pyannote (RTTM)")
+            else:
+                missing = []
+                if not funasr_service_url:
+                    missing.append("FUNASR_SERVICE_URL")
+                if not pyannote_service_url:
+                    missing.append("PYANNOTE_SERVICE_URL")
+                if asr_model != "funasr":
+                    missing.append(f"asr_model应为'funasr'，当前为'{asr_model}'")
+                logger.info(f"ℹ️ 未启用并行流程，缺少配置: {', '.join(missing)}")
             
             if use_parallel_flow:
                 # 并行执行 FunASR 和 Pyannote
@@ -495,33 +507,42 @@ async def process_meeting_audio(
                 def run_pyannote_rttm():
                     """在后台线程中运行 Pyannote RTTM 生成"""
                     try:
+                        logger.info(f"🎤 开始调用 Pyannote RTTM 服务: {pyannote_service_url}/rttm")
                         # RTTM 是临时生成的，不保存到文件，直接返回字符串
                         resp = requests.post(
                             f"{pyannote_service_url}/rttm",
                             json={"audio_path": actual_audio_path},  # 使用实际路径（可能是临时文件）
                             timeout=600
                         )
+                        logger.info(f"🎤 Pyannote RTTM 服务响应: status_code={resp.status_code}")
                         if resp.status_code == 200:
                             result = resp.json()
                             rttm_content = result.get("rttm", "")
                             if rttm_content:
-                                logger.info(f"✅ Pyannote RTTM 生成成功（临时使用，不保存文件）")
+                                rttm_lines = rttm_content.strip().split('\n')
+                                logger.info(f"✅ Pyannote RTTM 生成成功: {len(rttm_lines)} 行（临时使用，不保存文件）")
+                            else:
+                                logger.warning(f"⚠️ Pyannote RTTM 内容为空")
                             return rttm_content
                         else:
-                            logger.warning(f"⚠️ Pyannote RTTM 生成失败: {resp.status_code}")
+                            logger.warning(f"⚠️ Pyannote RTTM 生成失败: {resp.status_code} - {resp.text[:200]}")
                             return ""
                     except Exception as e:
-                        logger.error(f"❌ Pyannote RTTM 生成异常: {e}")
+                        logger.error(f"❌ Pyannote RTTM 生成异常: {e}", exc_info=True)
                         return ""
                 
                 # 并行执行
+                logger.info("🔄 开始并行执行 FunASR 和 Pyannote...")
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     funasr_future = executor.submit(run_funasr_word_level)
                     pyannote_future = executor.submit(run_pyannote_rttm)
                     
                     # 等待两个任务完成
+                    logger.info("⏳ 等待 FunASR 和 Pyannote 完成...")
                     words = funasr_future.result()
+                    logger.info(f"✅ FunASR 完成: {len(words) if words else 0} 个字")
                     rttm_content = pyannote_future.result()
+                    logger.info(f"✅ Pyannote 完成: {len(rttm_content) if rttm_content else 0} 字符")
                 
                 if not words:
                     logger.warning("⚠️ FunASR 字级别识别结果为空，降级到原有流程")
@@ -577,8 +598,8 @@ async def process_meeting_audio(
                         message=f"ASR服务初始化失败: {str(e)}",
                         transcript=[]
                     )
-                
-                # 调用 ASR 服务听写
+
+            # 调用 ASR 服务听写
                 asr_result = asr_service.transcribe(target_audio_path)
                 raw_text = asr_result.get("text", "")
                 transcript_data = asr_result.get("transcript", [])
@@ -755,7 +776,7 @@ async def process_meeting_audio(
                             current_transcript=raw_text,
                             llm_model=llm_model
                         )
-                    else:
+        else:
                         # 总结模式：分块汇总
                         history_context = await meeting_history_service.process_by_summary(
                             meeting_ids=meeting_ids,
@@ -769,7 +790,7 @@ async def process_meeting_audio(
                     logger.error(f"❌ 历史会议处理失败: {e}")
                     # 不影响主流程，继续处理
                     history_context = None
-        
+
         # ---------------------------------------------------------
         # LLM 处理部分
         # ---------------------------------------------------------
@@ -831,16 +852,16 @@ async def process_meeting_audio(
                 logger.warning("⚠️ LLM 服务没有 chat 方法，使用原有逻辑")
                 
                 # RAG 分析（原有逻辑）
-                rag_analysis = llm_service.judge_rag(raw_text, template_id)
-                need_rag = rag_analysis.get("need_rag", False)
-                search_query = rag_analysis.get("search_query", "")
+        rag_analysis = llm_service.judge_rag(raw_text, template_id)
+        need_rag = rag_analysis.get("need_rag", False)
+        search_query = rag_analysis.get("search_query", "")
 
                 # 向量检索
-                context_info = "" 
-                if need_rag and search_query:
+        context_info = "" 
+        if need_rag and search_query:
                     if vector_service and vector_service.is_available():
-                        context_info = vector_service.search_similar(search_query)
-                        logger.info(f"📚 基于 '{search_query}' 检索到历史上下文")
+            context_info = vector_service.search_similar(search_query)
+            logger.info(f"📚 基于 '{search_query}' 检索到历史上下文")
                     else:
                         logger.warning("⚠️ 向量服务不可用，跳过历史检索")
 
@@ -881,7 +902,7 @@ async def process_meeting_audio(
                 )
                 for item in transcript_data
             ]
-
+        
         logger.info("✅ 任务完成")
 
         return MeetingResponse(
@@ -909,7 +930,7 @@ async def process_meeting_audio(
         # 1. 单文件清理
         if temp_file_path and os.path.exists(temp_file_path):
             try:
-                os.remove(temp_file_path)
+            os.remove(temp_file_path)
                 logger.info(f"🧹 临时文件已清理: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"⚠️ 清理临时文件失败: {e}")
@@ -940,7 +961,7 @@ async def archive_meeting_knowledge(request: ArchiveRequest):
                 status="failed", 
                 message="向量服务不可用，请检查Chroma配置"
             )
-        
+
         # 1. 调用向量服务保存数据
         # 这里的 save_knowledge 会自动把长文本切成 500 字的小块
         saved_chunks = vector_service.save_knowledge(
