@@ -270,12 +270,74 @@ async def transcribe_word_level(
         
         logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
         
+        # 优化：如果片段过多，先合并短片段（减少片段数量，提升处理速度）
+        if len(vad_segments) > 200:
+            logger.info(f"🔧 片段过多({len(vad_segments)}个)，合并短片段以提升处理速度...")
+            merged_segments = []
+            current_segment = None
+            MIN_SEGMENT_DURATION_MS = 5000  # 最小片段时长5秒
+            MAX_GAP_MS = 2000  # 最大间隔2秒
+            
+            for segment in vad_segments:
+                if not isinstance(segment, list) or len(segment) < 2:
+                    continue
+                
+                start_ms, end_ms = segment[0], segment[1]
+                
+                if end_ms == -1:
+                    if current_segment:
+                        merged_segments.append(current_segment)
+                    merged_segments.append(segment)
+                    current_segment = None
+                    continue
+                
+                duration_ms = end_ms - start_ms
+                
+                if current_segment is None:
+                    if duration_ms >= MIN_SEGMENT_DURATION_MS:
+                        merged_segments.append(segment)
+                    else:
+                        current_segment = segment
+                else:
+                    prev_end = current_segment[1]
+                    gap_ms = start_ms - prev_end
+                    
+                    if gap_ms <= MAX_GAP_MS:
+                        current_segment[1] = end_ms
+                        merged_duration = current_segment[1] - current_segment[0]
+                        if merged_duration >= MIN_SEGMENT_DURATION_MS:
+                            merged_segments.append(current_segment)
+                            current_segment = None
+                    else:
+                        if current_segment[1] != -1:
+                            prev_duration = current_segment[1] - current_segment[0]
+                            if prev_duration >= MIN_SEGMENT_DURATION_MS:
+                                merged_segments.append(current_segment)
+                            elif len(merged_segments) > 0:
+                                merged_segments[-1][1] = current_segment[1]
+                        if duration_ms >= MIN_SEGMENT_DURATION_MS:
+                            merged_segments.append(segment)
+                            current_segment = None
+                        else:
+                            current_segment = segment
+            
+            if current_segment:
+                merged_duration = current_segment[1] - current_segment[0] if current_segment[1] != -1 else 999999
+                if merged_duration >= 1.0:
+                    merged_segments.append(current_segment)
+                elif len(merged_segments) > 0:
+                    merged_segments[-1][1] = current_segment[1]
+            
+            original_count = len(vad_segments)
+            vad_segments = merged_segments
+            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个）")
+        
         # 步骤2: 批量识别并提取字级别时间戳
         audio_file_path = str(temp_file_path) if temp_file_path else input_data
         
         # 配置：10GB显存优化
         BATCH_SIZE = 8  # 每批处理8个片段
-        MAX_CONCURRENT = 2  # 最多2个并发线程
+        MAX_CONCURRENT = 4  # 增加到4个并发线程（提升片段提取速度）
         
         import subprocess
         import tempfile as tmp
@@ -366,7 +428,21 @@ async def transcribe_word_level(
                 for i, (idx, start_ms, end_ms) in enumerate(batch_metadata):
                     if i < len(batch_results) and batch_results[i]:
                         result_item = batch_results[i]
+                        
+                        # 调试：打印ASR结果结构
+                        if i == 0 and batch_start == 0:
+                            logger.debug(f"🔍 ASR结果结构: {list(result_item.keys())}")
+                            if "text" in result_item:
+                                logger.debug(f"🔍 文本内容: {result_item['text'][:50]}...")
+                            if "timestamp" in result_item:
+                                logger.debug(f"🔍 timestamp字段: {type(result_item['timestamp'])}")
+                            if "sentences" in result_item:
+                                logger.debug(f"🔍 sentences字段: {len(result_item.get('sentences', []))} 个句子")
+                        
                         words = extract_word_level_timestamps(result_item)
+                        
+                        if not words and i == 0 and batch_start == 0:
+                            logger.warning(f"⚠️ 片段 {idx} 未提取到字级别时间戳，ASR结果: {result_item}")
                         
                         # 调整时间戳：加上片段的起始时间
                         segment_start_sec = start_ms / 1000.0

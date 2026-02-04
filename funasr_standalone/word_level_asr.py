@@ -20,9 +20,14 @@ def extract_word_level_timestamps(asr_result: Dict[str, Any]) -> List[Dict[str, 
     """
     words = []
     
+    # 调试：打印ASR结果结构
+    if not words:
+        logger.debug(f"🔍 提取字级别时间戳，ASR结果键: {list(asr_result.keys())}")
+    
     # 检查是否有 timestamp 字段（字级别）
     timestamp = asr_result.get("timestamp", [])
     if timestamp and len(timestamp) > 0:
+        logger.debug(f"🔍 使用timestamp字段，共 {len(timestamp)} 个时间戳")
         for ts_item in timestamp:
             if isinstance(ts_item, list) and len(ts_item) >= 2:
                 start = ts_item[0] / 1000.0 if isinstance(ts_item[0], (int, float)) else 0.0
@@ -40,6 +45,7 @@ def extract_word_level_timestamps(asr_result: Dict[str, Any]) -> List[Dict[str, 
     if not words:
         sentences = asr_result.get("sentences", [])
         if sentences:
+            logger.debug(f"🔍 使用sentences字段，共 {len(sentences)} 个句子")
             for sent in sentences:
                 sent_text = sent.get("text", "")
                 sent_timestamp = sent.get("timestamp", [])
@@ -63,6 +69,12 @@ def extract_word_level_timestamps(asr_result: Dict[str, Any]) -> List[Dict[str, 
         text = asr_result.get("text", "")
         start_time = asr_result.get("start_time", 0.0)
         end_time = asr_result.get("end_time", 0.0)
+        
+        if text:
+            logger.debug(f"🔍 使用text字段，文本长度: {len(text)}")
+            # 如果没有时间信息，使用默认值
+            if end_time <= start_time:
+                end_time = start_time + len(text) * 0.1  # 假设每个字0.1秒
         
         if text and end_time > start_time:
             char_duration = (end_time - start_time) / len(text)
