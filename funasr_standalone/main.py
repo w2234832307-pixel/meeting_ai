@@ -189,34 +189,74 @@ async def health_check():
 # 支持 file 上传或 audio_url 两种输入方式
 @router.post("/transcribe/word-level")
 async def transcribe_word_level(
-    audio_path: str = Form(...),  # 音频文件路径
+    file: UploadFile = File(None),  # 文件上传（可选）
+    audio_path: str = Form(None),  # 音频文件路径（可选）
+    audio_url: str = Form(None),   # 音频URL（可选）
     hotword: str = Form("")
 ) -> dict:
     """
     字级别 ASR 识别接口（用于并行处理）
     
-    输入：音频文件路径
+    输入方式（三选一）：
+    1. file: 文件上传
+    2. audio_path: 本地文件路径
+    3. audio_url: 音频URL
+    
     返回字级别时间戳，格式: [{"char": "你", "start": 0.5, "end": 0.6}, ...]
     """
     from word_level_asr import extract_word_level_timestamps
     
-    if not os.path.exists(audio_path):
-        return {
-            "code": 1,
-            "msg": f"音频文件不存在: {audio_path}",
-            "words": []
-        }
+    temp_file_path = None
+    input_data = None
     
     try:
-        # 调用 ASR 模型（整个文件，不进行 VAD 分段）
-        logger.info(f"🎤 开始字级别识别: {audio_path}")
+        # === 处理输入：支持文件上传、本地路径、URL ===
+        if file:
+            logger.info(f"📥 接收到文件上传: {file.filename}")
+            suffix = Path(file.filename).suffix if file.filename else ".mp3"
+            # 存临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                shutil.copyfileobj(file.file, tmp)
+                temp_file_path = Path(tmp.name)
+            input_data = str(temp_file_path)
+            
+        elif audio_path:
+            logger.info(f"📂 接收到本地文件路径: {audio_path}")
+            if not os.path.exists(audio_path):
+                return {
+                    "code": 1,
+                    "msg": f"音频文件不存在: {audio_path}",
+                    "words": []
+                }
+            input_data = audio_path.strip()
+            
+        elif audio_url:
+            logger.info(f"🔗 接收到音频 URL: {audio_url}")
+            input_data = audio_url.strip()
+            
+        else:
+            return {
+                "code": 1,
+                "msg": "必须提供 file、audio_path 或 audio_url 之一",
+                "words": []
+            }
+        
+        # === 音频预处理（可选，提升准确率3-5%）===
+        if isinstance(input_data, str) and Path(input_data).exists():
+            processed_input = audio_preprocessor.preprocess(input_data)
+            if processed_input != input_data:
+                logger.info("✅ 使用预处理后的音频")
+                input_data = processed_input
+        
+        # === 调用 ASR 模型（整个文件，不进行 VAD 分段）===
+        logger.info(f"🎤 开始字级别识别: {input_data}")
         result = asr_model.generate(
-            input=audio_path,
+            input=input_data,
             language="zh",
             use_itn=True
         )
         
-        # 提取字级别时间戳
+        # === 提取字级别时间戳 ===
         all_words = []
         if isinstance(result, list):
             for item in result:
@@ -232,6 +272,7 @@ async def transcribe_word_level(
             "msg": "success",
             "words": all_words
         }
+        
     except Exception as e:
         logger.error(f"❌ 字级别识别失败: {e}")
         return {
@@ -239,6 +280,14 @@ async def transcribe_word_level(
             "msg": str(e),
             "words": []
         }
+    finally:
+        # 清理临时文件
+        if temp_file_path and temp_file_path.exists():
+            try:
+                os.remove(temp_file_path)
+                logger.debug(f"🧹 已清理临时文件: {temp_file_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ 清理临时文件失败: {e}")
 
 
 @router.post("/transcribe")
