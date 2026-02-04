@@ -6,3 +6,4 @@ models/
 *.wav
 *.log
 .DS_Store
+models/
