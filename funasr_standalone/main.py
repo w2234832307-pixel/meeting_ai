@@ -248,23 +248,164 @@ async def transcribe_word_level(
                 logger.info("✅ 使用预处理后的音频")
                 input_data = processed_input
         
-        # === 调用 ASR 模型（整个文件，不进行 VAD 分段）===
-        logger.info(f"🎤 开始字级别识别: {input_data}")
-        result = asr_model.generate(
+        # === 使用 VAD 分段，避免长音频显存溢出 ===
+        logger.info(f"🎤 开始字级别识别（VAD分段模式）: {input_data}")
+        
+        # 步骤1: VAD 语音分段
+        logger.info("🎤 步骤1: VAD 语音分段...")
+        vad_res = vad_model.generate(
             input=input_data,
-            language="zh",
-            use_itn=True
+            batch_size_s=60  # 每60秒一段
         )
         
-        # === 提取字级别时间戳 ===
+        # 提取 VAD 分段信息
+        vad_segments = []
+        if vad_res and len(vad_res) > 0:
+            vad_result = vad_res[0]
+            vad_segments = vad_result.get("value", [])
+        
+        if not vad_segments or len(vad_segments) == 0:
+            logger.warning("⚠️ VAD 未检测到语音段，使用全文识别")
+            vad_segments = [[0, -1]]  # 使用整个音频
+        
+        logger.info(f"✅ VAD 检测到 {len(vad_segments)} 个语音段")
+        
+        # 步骤2: 批量识别并提取字级别时间戳
+        audio_file_path = str(temp_file_path) if temp_file_path else input_data
+        
+        # 配置：10GB显存优化
+        BATCH_SIZE = 8  # 每批处理8个片段
+        MAX_CONCURRENT = 2  # 最多2个并发线程
+        
+        import subprocess
+        import tempfile as tmp
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import io
+        import soundfile as sf
+        import numpy as np
+        
+        # 批量提取片段到内存
+        logger.info(f"📦 批量提取 {len(vad_segments)} 个音频片段到内存...")
+        segment_audio_data = {}
+        segment_metadata = {}
+        
+        def extract_segment_to_memory(idx, segment):
+            """提取单个片段到内存"""
+            if not isinstance(segment, list) or len(segment) < 2:
+                return None, None
+            
+            start_ms, end_ms = segment[0], segment[1]
+            
+            try:
+                cmd = ["ffmpeg", "-i", audio_file_path, "-ss", str(start_ms / 1000.0)]
+                if end_ms != -1:
+                    duration = (end_ms - start_ms) / 1000.0
+                    cmd.extend(["-t", str(duration)])
+                cmd.extend(["-ac", "1", "-ar", "16000", "-f", "wav", "-"])
+                
+                result = subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+                audio_io = io.BytesIO(result.stdout)
+                audio_data, sample_rate = sf.read(audio_io)
+                return (audio_data, sample_rate), (start_ms, end_ms)
+            except Exception as e:
+                logger.warning(f"⚠️ 提取片段 {idx} 失败: {e}")
+                return None, None
+        
+        # 并行提取片段
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+            futures = {
+                executor.submit(extract_segment_to_memory, idx, segment): idx 
+                for idx, segment in enumerate(vad_segments)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    audio_data_info, metadata = future.result()
+                    if audio_data_info is not None:
+                        segment_audio_data[idx] = audio_data_info
+                        segment_metadata[idx] = metadata
+                except Exception as e:
+                    logger.warning(f"⚠️ 提取片段 {idx} 异常: {e}")
+        
+        logger.info(f"✅ 成功提取 {len(segment_audio_data)} 个片段到内存")
+        
+        # 批量识别并提取字级别时间戳
         all_words = []
-        if isinstance(result, list):
-            for item in result:
-                words = extract_word_level_timestamps(item)
-                all_words.extend(words)
-        elif isinstance(result, dict):
-            words = extract_word_level_timestamps(result)
-            all_words.extend(words)
+        sorted_indices = sorted(segment_audio_data.keys())
+        
+        # 分批处理
+        for batch_start in range(0, len(sorted_indices), BATCH_SIZE):
+            batch_indices = sorted_indices[batch_start:batch_start + BATCH_SIZE]
+            logger.info(f"🔄 批量识别片段 {batch_start+1}-{min(batch_start+BATCH_SIZE, len(sorted_indices))}/{len(sorted_indices)}")
+            
+            # 将内存中的音频数据写入临时文件
+            batch_files = []
+            batch_metadata = []
+            
+            for idx in batch_indices:
+                audio_data, sample_rate = segment_audio_data[idx]
+                start_ms, end_ms = segment_metadata[idx]
+                
+                temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
+                temp_segment.close()
+                temp_segment_path = temp_segment.name
+                
+                sf.write(temp_segment_path, audio_data, sample_rate)
+                batch_files.append(temp_segment_path)
+                batch_metadata.append((idx, start_ms, end_ms))
+            
+            # 批量识别
+            try:
+                batch_results = asr_model.generate(
+                    input=batch_files,
+                    language="zh",
+                    use_itn=True
+                )
+                
+                # 提取字级别时间戳并调整时间偏移
+                for i, (idx, start_ms, end_ms) in enumerate(batch_metadata):
+                    if i < len(batch_results) and batch_results[i]:
+                        result_item = batch_results[i]
+                        words = extract_word_level_timestamps(result_item)
+                        
+                        # 调整时间戳：加上片段的起始时间
+                        segment_start_sec = start_ms / 1000.0
+                        for word in words:
+                            word["start"] = round(word["start"] + segment_start_sec, 3)
+                            word["end"] = round(word["end"] + segment_start_sec, 3)
+                        
+                        all_words.extend(words)
+                
+            except Exception as e:
+                logger.warning(f"⚠️ 批量识别失败: {e}，降级为单段识别")
+                # 降级：单段识别
+                for i, (idx, start_ms, end_ms) in enumerate(batch_metadata):
+                    if i < len(batch_files):
+                        try:
+                            seg_res = asr_model.generate(
+                                input=batch_files[i],
+                                language="zh",
+                                use_itn=True
+                            )
+                            if seg_res and len(seg_res) > 0:
+                                words = extract_word_level_timestamps(seg_res[0])
+                                segment_start_sec = start_ms / 1000.0
+                                for word in words:
+                                    word["start"] = round(word["start"] + segment_start_sec, 3)
+                                    word["end"] = round(word["end"] + segment_start_sec, 3)
+                                all_words.extend(words)
+                        except Exception as e2:
+                            logger.warning(f"⚠️ 识别片段 {idx} 失败: {e2}")
+            finally:
+                # 清理批量临时文件
+                for temp_file in batch_files:
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+        
+        # 按时间排序
+        all_words.sort(key=lambda x: x["start"])
         
         logger.info(f"✅ 字级别识别完成: {len(all_words)} 个字")
         return {
