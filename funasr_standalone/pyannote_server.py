@@ -22,14 +22,14 @@
 FunASR 主服务再通过 HTTP 调用本服务的 /diarize 接口即可。
 """
 import os
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from pyannote_diarization import perform_pyannote_diarization
+from pyannote_diarization import perform_pyannote_diarization, get_pyannote_pipeline
 
 # 加载 .env 文件（如果存在）
 env_path = Path(__file__).parent / ".env"
@@ -54,6 +54,60 @@ class DiarizeResponse(BaseModel):
 
 
 app = FastAPI(title="Pyannote Diarization Service", version="1.0.0")
+
+
+class RTTMRequest(BaseModel):
+    audio_path: str
+
+
+class RTTMResponse(BaseModel):
+    rttm: str
+    error: Optional[str] = None
+
+
+@app.post("/rttm", response_model=RTTMResponse)
+async def get_rttm(req: RTTMRequest) -> RTTMResponse:
+    """
+    获取 RTTM 格式的说话人分离结果（用于并行处理）
+    
+    - 输入：音频文件路径（本地文件）
+    - 输出：RTTM 格式的字符串（仅在内存中，不保存到文件）
+    
+    注意：
+    - RTTM 内容只在内存中生成和返回，不会保存到磁盘
+    - 调用方处理完 RTTM 后，内容会自动释放
+    - 如果需要在磁盘上保存 RTTM，请在调用方自行处理
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    hf_token = os.getenv("HF_TOKEN") or None
+    
+    try:
+        # 获取 pipeline（复用现有逻辑）
+        pipeline = get_pyannote_pipeline(use_auth_token=hf_token)
+        if pipeline is None:
+            return RTTMResponse(rttm="", error="Failed to load Pyannote pipeline")
+        
+        # 处理音频
+        logger.info(f"📂 处理音频文件生成 RTTM: {req.audio_path}")
+        diarization = pipeline(req.audio_path)
+        
+        # 生成 RTTM 格式（仅在内存中，不保存到文件）
+        rttm_lines = []
+        file_id = Path(req.audio_path).stem
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            # RTTM 格式: SPEAKER <file> 1 <start> <duration> <NA> <NA> <speaker> <NA> <NA>
+            start = turn.start
+            duration = turn.end - turn.start
+            rttm_lines.append(f"SPEAKER {file_id} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>")
+        
+        rttm_content = "\n".join(rttm_lines)
+        logger.info(f"✅ 生成 RTTM 完成，共 {len(rttm_lines)} 个说话人片段（仅在内存中，未保存到文件）")
+        return RTTMResponse(rttm=rttm_content)
+    except Exception as e:
+        logger.error(f"❌ 生成 RTTM 失败: {e}")
+        return RTTMResponse(rttm="", error=str(e))
 
 
 @app.post("/diarize", response_model=DiarizeResponse)

@@ -187,6 +187,60 @@ async def health_check():
     return {"status": "ok", "message": "FunASR Service is running"}
 
 # 支持 file 上传或 audio_url 两种输入方式
+@router.post("/transcribe/word-level")
+async def transcribe_word_level(
+    audio_path: str = Form(...),  # 音频文件路径
+    hotword: str = Form("")
+) -> dict:
+    """
+    字级别 ASR 识别接口（用于并行处理）
+    
+    输入：音频文件路径
+    返回字级别时间戳，格式: [{"char": "你", "start": 0.5, "end": 0.6}, ...]
+    """
+    from word_level_asr import extract_word_level_timestamps
+    
+    if not os.path.exists(audio_path):
+        return {
+            "code": 1,
+            "msg": f"音频文件不存在: {audio_path}",
+            "words": []
+        }
+    
+    try:
+        # 调用 ASR 模型（整个文件，不进行 VAD 分段）
+        logger.info(f"🎤 开始字级别识别: {audio_path}")
+        result = asr_model.generate(
+            input=audio_path,
+            language="zh",
+            use_itn=True
+        )
+        
+        # 提取字级别时间戳
+        all_words = []
+        if isinstance(result, list):
+            for item in result:
+                words = extract_word_level_timestamps(item)
+                all_words.extend(words)
+        elif isinstance(result, dict):
+            words = extract_word_level_timestamps(result)
+            all_words.extend(words)
+        
+        logger.info(f"✅ 字级别识别完成: {len(all_words)} 个字")
+        return {
+            "code": 0,
+            "msg": "success",
+            "words": all_words
+        }
+    except Exception as e:
+        logger.error(f"❌ 字级别识别失败: {e}")
+        return {
+            "code": 1,
+            "msg": str(e),
+            "words": []
+        }
+
+
 @router.post("/transcribe")
 async def transcribe(
     # 1. file 改为可选
@@ -724,6 +778,8 @@ async def transcribe(
             for result in segment_results:
                 result['speaker_id'] = '0'
             speaker_info = []
+            # 跳过后续的编号规范化和说话人统计逻辑
+            skip_speaker_normalization = True
         else:
             # 检查是否使用Pyannote（通过环境变量或配置）
             use_pyannote = os.getenv("USE_PYANNOTE", "false").lower() == "true"
@@ -796,32 +852,32 @@ async def transcribe(
                 # Cam++ 方案：需要映射speaker_info到segment_results
                 # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
                 speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
-            
-            # 统计哪些 segment_idx 有声纹信息
-            valid_segment_indices = set(speaker_dict.keys())
-            logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
-            
-            # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
-            for idx, result in enumerate(segment_results):
-                seg_idx = result.get('segment_idx', -1)
                 
-                if seg_idx in speaker_dict:
-                    # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
-                    result['speaker_id'] = speaker_dict[seg_idx]
-                else:
-                    # 没有声纹信息，找到最近的有声纹片段
-                    found_speaker = None
-                    min_distance = float('inf')
+                # 统计哪些 segment_idx 有声纹信息
+                valid_segment_indices = set(speaker_dict.keys())
+                logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
+                
+                # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
+                for idx, result in enumerate(segment_results):
+                    seg_idx = result.get('segment_idx', -1)
                     
-                    # 查找最近的有效片段
-                    for valid_idx in valid_segment_indices:
-                        distance = abs(valid_idx - seg_idx)
-                        if distance < min_distance:
-                            min_distance = distance
-                            found_speaker = speaker_dict[valid_idx]
-                    
-                    # 如果找到了，使用该说话人ID；否则使用默认值"0"
-                    result['speaker_id'] = found_speaker if found_speaker is not None else "0"
+                    if seg_idx in speaker_dict:
+                        # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
+                        result['speaker_id'] = speaker_dict[seg_idx]
+                    else:
+                        # 没有声纹信息，找到最近的有声纹片段
+                        found_speaker = None
+                        min_distance = float('inf')
+                        
+                        # 查找最近的有效片段
+                        for valid_idx in valid_segment_indices:
+                            distance = abs(valid_idx - seg_idx)
+                            if distance < min_distance:
+                                min_distance = distance
+                                found_speaker = speaker_dict[valid_idx]
+                        
+                        # 如果找到了，使用该说话人ID；否则使用默认值"0"
+                        result['speaker_id'] = found_speaker if found_speaker is not None else "0"
             else:
                 # Pyannote 方案：已经直接更新了segment_results，不需要额外处理
                 logger.debug("✅ Pyannote 已直接更新说话人信息，跳过映射步骤")
@@ -829,41 +885,46 @@ async def transcribe(
         # 强制重新映射说话人ID，确保从0开始连续编号
         # 注意：这只是编号规范化，不影响识别结果！
         # 哪些片段属于哪个说话人是由声纹聚类算法决定的，不是写死的
+        # 如果说话人分离已禁用（由主服务使用Pyannote处理），则跳过此步骤
         
-        all_speaker_ids = set(r['speaker_id'] for r in segment_results)
-        
-        # 找出每个说话人ID第一次出现的时间
-        first_occurrence = {}
-        for result in segment_results:
-            speaker_id = result['speaker_id']
-            start_time = result.get('start_time', 0)
-            if speaker_id not in first_occurrence or start_time < first_occurrence[speaker_id]:
-                first_occurrence[speaker_id] = start_time
-        
-        # 按第一次出现的时间排序（第一个出现的说话人 -> 0，第二个 -> 1...）
-        unique_speakers = sorted(all_speaker_ids, key=lambda x: first_occurrence[x])
-        n_speakers = len(unique_speakers)
-        
-        # 重新映射：第一个出现的说话人 -> 0，第二个 -> 1...
-        # 这只是编号规范化，不影响哪些片段属于哪个说话人
-        
-        speaker_remap = {old_id: str(new_id) for new_id, old_id in enumerate(unique_speakers)}
-        logger.debug(f"🔍 映射关系: {speaker_remap}")
-        
-        for result in segment_results:
-            old_id = result['speaker_id']
-            result['speaker_id'] = speaker_remap[old_id]
-        
-        # 验证映射结果
-        final_ids = sorted(set(int(r['speaker_id']) for r in segment_results))
-        if final_ids != list(range(n_speakers)):
-            logger.error(f"❌ 映射后ID仍不连续: {final_ids}")
+        if not enable_speaker_diarization:
+            # 说话人分离已禁用，跳过编号规范化
+            logger.debug("ℹ️ 说话人分离已禁用，跳过编号规范化（将由主服务处理）")
         else:
-            # 检查第一个片段的ID
-            first_speaker_id = segment_results[0]['speaker_id'] if segment_results else "N/A"
-            logger.info(f"✅ 编号规范化完成: 0-{n_speakers-1}，第一个片段 speaker_id={first_speaker_id}")
-        
-        logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人（基于真实声纹聚类）")
+            all_speaker_ids = set(r['speaker_id'] for r in segment_results)
+            
+            # 找出每个说话人ID第一次出现的时间
+            first_occurrence = {}
+            for result in segment_results:
+                speaker_id = result['speaker_id']
+                start_time = result.get('start_time', 0)
+                if speaker_id not in first_occurrence or start_time < first_occurrence[speaker_id]:
+                    first_occurrence[speaker_id] = start_time
+            
+            # 按第一次出现的时间排序（第一个出现的说话人 -> 0，第二个 -> 1...）
+            unique_speakers = sorted(all_speaker_ids, key=lambda x: first_occurrence[x])
+            n_speakers = len(unique_speakers)
+            
+            # 重新映射：第一个出现的说话人 -> 0，第二个 -> 1...
+            # 这只是编号规范化，不影响哪些片段属于哪个说话人
+            
+            speaker_remap = {old_id: str(new_id) for new_id, old_id in enumerate(unique_speakers)}
+            logger.debug(f"🔍 映射关系: {speaker_remap}")
+            
+            for result in segment_results:
+                old_id = result['speaker_id']
+                result['speaker_id'] = speaker_remap[old_id]
+            
+            # 验证映射结果
+            final_ids = sorted(set(int(r['speaker_id']) for r in segment_results))
+            if final_ids != list(range(n_speakers)):
+                logger.error(f"❌ 映射后ID仍不连续: {final_ids}")
+            else:
+                # 检查第一个片段的ID
+                first_speaker_id = segment_results[0]['speaker_id'] if segment_results else "N/A"
+                logger.info(f"✅ 编号规范化完成: 0-{n_speakers-1}，第一个片段 speaker_id={first_speaker_id}")
+            
+            logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人（基于真实声纹聚类）")
         
         # ===== 步骤4：构建最终结果 =====
         html_text = full_text  # 保持兼容性
@@ -1030,75 +1091,9 @@ async def transcribe(
         except Exception as e:
             logger.warning(f"⚠️ 热词替换失败: {e}")
         
-        # ===== 声纹识别（可选，如果声纹库为空则跳过）=====
-        matched_info = {}
-        try:
-            # 延迟导入，避免启动时的依赖错误
-            # 注意：datasets 兼容性修复已在文件开头执行
-            from voice_matcher import get_voice_matcher
-            
-            voice_matcher = get_voice_matcher()
-            if voice_matcher and voice_matcher.enabled and transcript and temp_file_path:
-                logger.info("🎙️ 开始声纹匹配...")
-                
-                # 1. 为每个说话人提取音频片段（每个speaker_id只提取一次）
-                speaker_segments = voice_matcher.extract_speaker_segments(
-                    audio_path=str(temp_file_path),
-                    transcript=transcript,
-                    duration=10  # 提取10秒
-                )
-                
-                if speaker_segments:
-                    logger.info(f"✅ 提取到 {len(speaker_segments)} 个说话人的音频片段（每个speaker_id只提取一次）")
-                    
-                    # 2. 匹配说话人身份（每个speaker_id只匹配一次）
-                    matched = voice_matcher.match_speakers(
-                        speaker_segments=speaker_segments,
-                        threshold=0.75  # 相似度阈值75%
-                    )
-                    
-                    if matched:
-                        logger.info(f"✅ 匹配成功: {len(matched)} 个说话人")
-                        
-                        # 3. 替换speaker_id为真实姓名
-                        transcript = voice_matcher.replace_speaker_ids(transcript, matched)
-                        
-                        # 添加匹配信息到返回数据
-                        matched_info = {
-                            speaker_id: {
-                                "name": name,
-                                "employee_id": employee_id,
-                                "similarity": similarity
-                            }
-                            for speaker_id, (employee_id, name, similarity) in matched.items()
-                        }
-                    else:
-                        logger.warning("⚠️ 未匹配到任何说话人")
-                        matched_info = {}
-                else:
-                    logger.warning("⚠️ 未能提取说话人音频片段")
-                    matched_info = {}
-            else:
-                matched_info = {}
-                if not voice_matcher:
-                    logger.warning("⚠️ 声纹匹配器未初始化")
-                elif not voice_matcher.enabled:
-                    logger.info("ℹ️ 声纹库为空，跳过声纹匹配")
-                    
-        except ImportError as e:
-            logger.warning(f"⚠️ 声纹匹配模块导入失败（依赖缺失），跳过声纹匹配")
-            logger.warning(f"   错误详情: {e}")
-            logger.warning(f"   如需使用声纹识别，请运行以下命令：")
-            logger.warning(f"   pip install 'datasets>=2.14.0' 'chromadb==0.5.0'")
-            logger.warning(f"   这是 datasets 版本兼容性问题，请尝试：")
-            logger.warning(f"   1. 使用兼容版本: pip install 'datasets==2.17.0' 或 'datasets==2.18.0'")
-            logger.warning(f"   2. 或升级 modelscope: pip install -U modelscope")
-            logger.warning(f"   3. 如果 flagembedding 需要 datasets>=2.19.0，考虑创建独立环境")
-            logger.warning(f"   注意：已尝试自动修补，但可能不够，建议使用兼容版本")
-            matched_info = {}
-        except Exception as e:
-            logger.error(f"❌ 声纹匹配失败: {e}", exc_info=True)
-            matched_info = {}
+        # ===== 注意：声纹匹配已移至主服务（app/api/endpoints.py）=====
+        # 声纹匹配应该在 Pyannote 说话人分离之后执行，用于识别说话人的真实身份
+        # 因此不再在 FunASR 服务中执行声纹匹配
         
         return {
             "code": 0,
@@ -1108,8 +1103,7 @@ async def transcribe(
             "data": {
                 "text": full_text,
                 "html": html_text,
-                "transcript": transcript,
-                "voice_matched": matched_info if matched_info else None  # 声纹匹配结果
+                "transcript": transcript
             }
         }
 

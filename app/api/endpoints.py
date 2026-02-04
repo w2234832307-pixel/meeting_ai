@@ -422,34 +422,183 @@ async def process_meeting_audio(
                     )
                 logger.info(f"📊 音频文件大小: {file_size_mb:.2f}MB")
 
-            # 获取 ASR 服务（动态选择）⭐
-            try:
-                asr_service = get_asr_service_by_name(asr_model)
-                logger.info(f"🎤 使用ASR模型: {asr_model}")
-            except Exception as e:
-                return MeetingResponse(
-                    status="failed", 
-                    message=f"ASR服务初始化失败: {str(e)}",
-                    transcript=[]
-                )
+            # ============================================================
+            # 新流程：并行处理 FunASR 和 Pyannote
+            # ============================================================
+            from app.services.parallel_processor import map_words_to_speakers, aggregate_by_speaker, parse_rttm
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import requests
+            import tempfile
             
-            # 调用 ASR 服务听写
-            asr_result = asr_service.transcribe(target_audio_path)
-            raw_text = asr_result.get("text", "")
-            transcript_data = asr_result.get("transcript", [])
+            # 检查是否使用新流程（需要同时配置 FunASR 和 Pyannote）
+            use_parallel_flow = False
+            funasr_service_url = os.getenv("FUNASR_SERVICE_URL", "")
+            pyannote_service_url = os.getenv("PYANNOTE_SERVICE_URL", "")
+            
+            # 如果音频是 URL，先下载到临时文件
+            temp_audio_file = None
+            actual_audio_path = target_audio_path
+            
+            if target_audio_path.startswith(("http://", "https://")):
+                try:
+                    logger.info(f"📥 音频为 URL，正在下载到临时文件: {target_audio_path}")
+                    resp = requests.get(target_audio_path, timeout=300, stream=True)
+                    resp.raise_for_status()
+                    
+                    # 创建临时文件（使用流式下载以节省内存）
+                    file_ext = os.path.splitext(target_audio_path)[1] or ".mp3"
+                    temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_ext)
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            temp_audio_file.write(chunk)
+                    temp_audio_file.close()
+                    
+                    actual_audio_path = temp_audio_file.name
+                    file_size_mb = os.path.getsize(actual_audio_path) / 1024 / 1024
+                    logger.info(f"✅ 音频下载完成: {actual_audio_path} (大小: {file_size_mb:.2f}MB)")
+                except Exception as e:
+                    logger.warning(f"⚠️ 下载音频 URL 失败: {e}，将使用原有流程")
+                    actual_audio_path = target_audio_path
+            
+            if funasr_service_url and pyannote_service_url and asr_model == "funasr":
+                use_parallel_flow = True
+                logger.info("🚀 使用新流程：并行处理 FunASR (字级别) + Pyannote (RTTM)")
+            
+            if use_parallel_flow:
+                # 并行执行 FunASR 和 Pyannote
+                def run_funasr_word_level():
+                    """在后台线程中运行 FunASR 字级别识别"""
+                    try:
+                        data = {
+                            'audio_path': actual_audio_path,  # 使用实际路径（可能是临时文件）
+                            'hotword': ''
+                        }
+                        resp = requests.post(
+                            f"{funasr_service_url}/transcribe/word-level",
+                            data=data,
+                            timeout=600
+                        )
+                        if resp.status_code == 200:
+                            result = resp.json()
+                            if result.get("code") == 0:
+                                return result.get("words", [])
+                            else:
+                                logger.warning(f"⚠️ FunASR 字级别识别失败: {result.get('msg')}")
+                                return []
+                        else:
+                            logger.warning(f"⚠️ FunASR 字级别识别失败: {resp.status_code} - {resp.text}")
+                            return []
+                    except Exception as e:
+                        logger.error(f"❌ FunASR 字级别识别异常: {e}")
+                        return []
+                
+                def run_pyannote_rttm():
+                    """在后台线程中运行 Pyannote RTTM 生成"""
+                    try:
+                        # RTTM 是临时生成的，不保存到文件，直接返回字符串
+                        resp = requests.post(
+                            f"{pyannote_service_url}/rttm",
+                            json={"audio_path": actual_audio_path},  # 使用实际路径（可能是临时文件）
+                            timeout=600
+                        )
+                        if resp.status_code == 200:
+                            result = resp.json()
+                            rttm_content = result.get("rttm", "")
+                            if rttm_content:
+                                logger.info(f"✅ Pyannote RTTM 生成成功（临时使用，不保存文件）")
+                            return rttm_content
+                        else:
+                            logger.warning(f"⚠️ Pyannote RTTM 生成失败: {resp.status_code}")
+                            return ""
+                    except Exception as e:
+                        logger.error(f"❌ Pyannote RTTM 生成异常: {e}")
+                        return ""
+                
+                # 并行执行
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    funasr_future = executor.submit(run_funasr_word_level)
+                    pyannote_future = executor.submit(run_pyannote_rttm)
+                    
+                    # 等待两个任务完成
+                    words = funasr_future.result()
+                    rttm_content = pyannote_future.result()
+                
+                if not words:
+                    logger.warning("⚠️ FunASR 字级别识别结果为空，降级到原有流程")
+                    use_parallel_flow = False
+                elif not rttm_content:
+                    logger.warning("⚠️ Pyannote RTTM 生成失败，降级到原有流程")
+                    use_parallel_flow = False
+                else:
+                    # 解析 RTTM
+                    rttm_segments = parse_rttm(rttm_content)
+                    logger.info(f"✅ 并行处理完成: {len(words)} 个字, {len(rttm_segments)} 个说话人片段")
+                    
+                    # 字级别映射说话人
+                    mapped_words = map_words_to_speakers(words, rttm_segments)
+                    logger.info(f"✅ 字级别映射完成: {len(mapped_words)} 个字已分配说话人")
+                    
+                    # 按说话人聚合句子
+                    transcript_data = aggregate_by_speaker(mapped_words)
+                    logger.info(f"✅ 句子聚合完成: {len(transcript_data)} 个句子")
+                    
+                    # 生成 raw_text
+                    raw_text = "".join([item.get("text", "") for item in transcript_data])
+                    
+                    # 转换格式为 TranscriptItem
+                    transcript_data = [
+                        {
+                            "text": item.get("text", ""),
+                            "start_time": item.get("start", 0.0),
+                            "end_time": item.get("end", 0.0),
+                            "speaker_id": item.get("speaker_id", "SPEAKER_00")
+                        }
+                        for item in transcript_data
+                    ]
+                    
+                    # 注意：RTTM 内容只在内存中使用，不保存到文件，处理完成后自动释放
+                    logger.debug("ℹ️ RTTM 内容已在内存中处理完成，未保存到文件")
+                    
+                    # 新流程中，声纹匹配在下面统一处理（无论是否使用并行流程）
+            
+            # 清理临时音频文件（如果是从 URL 下载的）
+            # 注意：在声纹匹配完成后再清理，因为声纹匹配也需要音频文件
+            cleanup_temp_file = False
+            
+            # 如果新流程失败或未启用，使用原有流程
+            if not use_parallel_flow:
+                # 获取 ASR 服务（动态选择）⭐
+                try:
+                    asr_service = get_asr_service_by_name(asr_model)
+                    logger.info(f"🎤 使用ASR模型: {asr_model}")
+                except Exception as e:
+                    return MeetingResponse(
+                        status="failed", 
+                        message=f"ASR服务初始化失败: {str(e)}",
+                        transcript=[]
+                    )
+                
+                # 调用 ASR 服务听写
+                asr_result = asr_service.transcribe(target_audio_path)
+                raw_text = asr_result.get("text", "")
+                transcript_data = asr_result.get("transcript", [])
 
             # ---------------------------------------------
             # 可选：调用独立 Pyannote 服务进行说话人分离（方案B）
             # 仅在配置了 PYANNOTE_SERVICE_URL 时启用
+            # 注意：如果音频是 URL，使用实际路径（临时文件）
             # ---------------------------------------------
             try:
                 from app.services.pyannote_service import get_pyannote_service
                 pyannote_service = get_pyannote_service()
+                
+                # 如果音频是 URL，使用实际路径（临时文件）
+                audio_path_for_pyannote = actual_audio_path if 'actual_audio_path' in locals() else target_audio_path
 
-                if pyannote_service.is_available() and transcript_data and not target_audio_path.startswith(("http://", "https://")):
+                if pyannote_service.is_available() and transcript_data:
                     logger.info("🎤 使用独立 Pyannote 服务优化说话人分离（方案B）")
                     transcript_data = pyannote_service.diarize(
-                        audio_path=target_audio_path,
+                        audio_path=audio_path_for_pyannote,
                         transcript=transcript_data,
                     )
                 else:
@@ -457,10 +606,62 @@ async def process_meeting_audio(
                         logger.info("ℹ️ 未配置 PYANNOTE_SERVICE_URL，跳过 Pyannote 分离")
                     elif not transcript_data:
                         logger.info("ℹ️ transcript 为空，跳过 Pyannote 分离")
-                    else:
-                        logger.info("ℹ️ 目标音频为 URL，当前 Pyannote 仅支持本地文件，跳过")
             except Exception as e:
                 logger.warning(f"⚠️ 调用 Pyannote 服务失败，保持原有说话人结果: {e}")
+            
+            # ---------------------------------------------
+            # 声纹匹配（在 Pyannote 说话人分离之后执行）
+            # 用于识别说话人的真实身份（匹配到员工声纹库）
+            # ---------------------------------------------
+            try:
+                from app.services.voice_service import voice_service
+                
+                # 如果音频是 URL，使用实际路径（临时文件）
+                audio_path_for_voice = actual_audio_path if 'actual_audio_path' in locals() else target_audio_path
+                
+                if voice_service and voice_service.enabled and transcript_data and audio_path_for_voice:
+                    logger.info("🎙️ 开始声纹匹配（识别说话人身份）...")
+                    
+                    # 1. 为每个说话人提取音频片段（每个speaker_id提取多个片段，用于计算均值）
+                    speaker_segments = voice_service.extract_speaker_segments(
+                        audio_path=audio_path_for_voice,
+                        transcript=transcript_data,
+                        duration=10  # 提取10秒
+                    )
+                    
+                    if speaker_segments:
+                        logger.info(f"✅ 提取到 {len(speaker_segments)} 个说话人的音频片段")
+                        
+                        # 2. 匹配说话人身份（每个speaker_id只匹配一次）
+                        matched = voice_service.match_speakers(
+                            speaker_segments=speaker_segments,
+                            threshold=0.75  # 相似度阈值75%
+                        )
+                        
+                        if matched:
+                            logger.info(f"✅ 声纹匹配成功: {len(matched)} 个说话人")
+                            
+                            # 3. 替换speaker_id为真实姓名
+                            transcript_data = voice_service.replace_speaker_ids(transcript_data, matched)
+                        else:
+                            logger.info("ℹ️ 未匹配到任何说话人（声纹库可能为空或相似度不足）")
+                    else:
+                        logger.info("ℹ️ 未能提取说话人音频片段，跳过声纹匹配")
+                elif not voice_service or not voice_service.enabled:
+                    logger.info("ℹ️ 声纹库为空，跳过声纹匹配")
+            except ImportError:
+                logger.debug("ℹ️ 声纹服务未安装，跳过声纹匹配")
+            except Exception as e:
+                logger.warning(f"⚠️ 声纹匹配失败: {e}")
+            
+            # 清理临时音频文件（如果是从 URL 下载的）
+            # 在所有处理完成后清理，确保声纹匹配等步骤都能使用
+            if 'temp_audio_file' in locals() and temp_audio_file and os.path.exists(temp_audio_file.name):
+                try:
+                    os.remove(temp_audio_file.name)
+                    logger.info(f"🧹 已清理临时音频文件: {temp_audio_file.name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 清理临时文件失败: {e}")
             
             if not raw_text:
                 return MeetingResponse(
