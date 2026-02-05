@@ -1,948 +1,212 @@
-import shutil
-import os
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+import os, shutil, uuid, tempfile, markdown, requests, traceback
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+
 from app.core.config import settings
 from app.core.logger import logger
 from app.schemas.task import MeetingResponse, ArchiveRequest, ArchiveResponse, TranscriptItem
 from app.services.vector import vector_service
 from app.services.asr_factory import get_asr_service_by_name
-from app.services.llm_factory import get_llm_service, get_llm_service_by_name
-import markdown
+from app.services.llm_factory import get_llm_service_by_name
 from app.services.document import document_service 
-# 延迟导入 voice_service，避免阻塞主服务启动
-# from app.services.voice_service import voice_service
-import uuid
+from app.services.prompt_template import prompt_template_service
 
-# 创建路由器
 router = APIRouter()
+
+# --- 辅助工具函数 ---
+
+def cleanup_files(files: list):
+    """统一清理临时文件"""
+    for f in files:
+        if f and os.path.exists(f):
+            try:
+                os.remove(f)
+                logger.info(f"🧹 已清理临时文件: {f}")
+            except Exception as e:
+                logger.warning(f"⚠️ 清理失败 {f}: {e}")
+
+async def handle_audio_parallel(audio_path: str, is_url: bool, asr_model: str):
+    """封装并行处理逻辑 (FunASR + Pyannote)"""
+    from app.services.parallel_processor import map_words_to_speakers, aggregate_by_speaker, parse_rttm
+    funasr_url = os.getenv("FUNASR_SERVICE_URL", "")
+    pyannote_url = os.getenv("PYANNOTE_SERVICE_URL", "")
+
+    def run_funasr():
+        url = f"{funasr_url}/transcribe/word-level"
+        params = {"hotword": ""}
+        if is_url:
+            return requests.post(url, data={"audio_url": audio_path, **params}, timeout=600).json().get("words", [])
+        with open(audio_path, "rb") as f:
+            return requests.post(url, files={"file": f}, data=params, timeout=600).json().get("words", [])
+
+    def run_pyannote():
+        url = f"{pyannote_url}/rttm"
+        if is_url:
+            return requests.post(url, data={"audio_url": audio_path}, timeout=600).json().get("rttm", "")
+        with open(audio_path, "rb") as f:
+            return requests.post(url, files={"file": f}, timeout=600).json().get("rttm", "")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_words = executor.submit(run_funasr)
+        f_rttm = executor.submit(run_pyannote)
+        words, rttm_content = f_words.result(), f_rttm.result()
+
+    if not words or not rttm_content:
+        return None, None
+
+    rttm_segments = parse_rttm(rttm_content)
+    mapped = map_words_to_speakers(words, rttm_segments)
+    transcript_data = aggregate_by_speaker(mapped)
+
+    # 调试：看一眼并行聚合后的原始 speaker_id（字符串形式）
+    try:
+        sample_speakers = [item.get("speaker_id") for item in transcript_data[:10]]
+        logger.info(f"🔎 并行聚合后原始 speaker_id 样例: {sample_speakers}")
+    except Exception as e:
+        logger.debug(f"调试 speaker_id 样例失败: {e}")
+    
+    # 辅助函数：将 SPEAKER_XX 转换为整数
+    def speaker_str_to_int(speaker_str: str) -> Optional[int]:
+        """将 'SPEAKER_01' 转换为 1，'SPEAKER_00' 转换为 0"""
+        if not speaker_str:
+            return None
+        try:
+            # 提取数字部分
+            if isinstance(speaker_str, int):
+                return speaker_str
+            if isinstance(speaker_str, str) and speaker_str.startswith("SPEAKER_"):
+                num_str = speaker_str.replace("SPEAKER_", "").strip()
+                return int(num_str) if num_str.isdigit() else None
+            # 尝试直接转换
+            return int(speaker_str) if str(speaker_str).isdigit() else None
+        except (ValueError, AttributeError):
+            return None
+    
+    # 标准化格式
+    formatted_data = [{
+        "text": item.get("text", ""),
+        "start_time": item.get("start", 0.0),
+        "end_time": item.get("end", 0.0),
+        "speaker_id": speaker_str_to_int(item.get("speaker_id", "SPEAKER_00"))
+    } for item in transcript_data]
+    
+    return "".join([i["text"] for i in formatted_data]), formatted_data
+
+# --- 主接口 ---
 
 @router.post("/process", response_model=MeetingResponse)
 async def process_meeting_audio(
-    # ========== 输入源参数（以下7种方式任选其一）==========
-    
-    files: Optional[List[UploadFile]] = File(
-        None, 
-        description="🎵 音频文件上传：\n• 支持格式：mp3/wav/m4a/mp4等\n• 支持单个或多个文件\n• 多个文件会自动合并处理"
-    ),
-    
-    file_paths: Optional[str] = Form(
-        None, 
-        description="📂 本地文件路径：\n• 单个：test_audio/meeting.mp3\n• 多个：audio1.mp3,audio2.mp3（逗号分隔）"
-    ),
-    
-    audio_urls: Optional[str] = Form(
-        None, 
-        description="🌐 音频URL地址：\n• 要求：可公网访问的URL（腾讯云ASR需要）\n• 单个：http://example.com/audio.mp3\n• 多个：url1,url2（逗号分隔）"
-    ),
-    
-    audio_id: Optional[int] = Form(
-        None, 
-        description="🔢 数据库音频ID：用于处理已存储到数据库的历史音频"
-    ),
-    
-    document_file: Optional[UploadFile] = File(
-        None, 
-        description="📄 文档文件上传：\n• 支持格式：Word(.docx) / PDF(.pdf) / 文本(.txt)\n• 直接提取文字生成纪要（不需要语音识别）"
-    ),
-
-    text_content: Optional[str] = Form(
-        None, 
-        description="📝 纯文本内容：\n• 直接输入会议文本或已转录好的内容\n• 跳过语音识别步骤，直接生成纪要"
-    ),
-
-    # ========== 模板参数 ==========
-    template: str = Form(
-        "default", 
-        description="📋 模板配置：\n• 预设模板ID：default（标准）/ simple（简洁）/ detailed（详细）\n• 文档路径：D:\\模板.docx（自定义格式）\n• JSON字符串：自定义提示词\n• 纯文本：直接的提示词内容"
-    ),
-
-    # ========== 用户需求参数 ==========
-    user_requirement: Optional[str] = Form(
-        None, 
-        description="✨ 特殊要求（可选）：对生成纪要的个性化需求，如\"重点关注预算讨论\"、\"简化技术细节\"等"
-    ),
-    
-    # ========== 历史会议参数 ==========
-    history_meeting_ids: Optional[str] = Form(
-        None, 
-        description="🔗 关联历史会议（可选）：\n• 格式：会议ID列表，逗号分隔\n• 示例：100,101,102\n• 用途：生成纪要时参考历史会议内容"
-    ),
-    
-    history_mode: str = Form(
-        "auto", 
-        description="📚 历史处理模式：\n• auto：自动判断（推荐）\n• retrieval：检索模式（查找相关历史内容）\n• summary：总结模式（提供历史会议总结）"
-    ),
-    
-    # ========== 模型配置参数 ==========
-    llm_model: str = Form(
-        "auto", 
-        description="🤖 LLM模型选择：\n• auto：自动选择（使用配置文件设置）\n• deepseek：DeepSeek API\n• qwen3：本地Qwen3模型"
-    ),
-    
-    llm_temperature: float = Form(
-        0.7, 
-        description="🌡️ 生成温度（0.0-1.0）：\n• 0.3：更保守，输出更确定\n• 0.7：平衡（推荐）\n• 1.0：更有创造性，输出更多样"
-    ),
-    
-    llm_max_tokens: int = Form(
-        2000, 
-        description="📏 最大生成长度：生成纪要的最大字数（token数）"
-    ),
-    
-    asr_model: str = Form(
-        "auto", 
-        description="🎤 语音识别模型：\n• auto：自动选择（使用配置文件设置）\n• funasr：本地FunASR（推荐）\n• tencent：腾讯云ASR"
-    ),
+    files: Optional[List[UploadFile]] = File(None),
+    file_paths: Optional[str] = Form(None),
+    audio_urls: Optional[str] = Form(None),
+    audio_id: Optional[int] = Form(None),
+    document_file: Optional[UploadFile] = File(None),
+    text_content: Optional[str] = Form(None),
+    template: str = Form("default"),
+    user_requirement: Optional[str] = Form(None),
+    history_meeting_ids: Optional[str] = Form(None),
+    history_mode: str = Form("auto"),
+    llm_model: str = Form("auto"),
+    llm_temperature: float = Form(0.7),
+    llm_max_tokens: int = Form(2000),
+    asr_model: str = Form("auto"),
 ):
-    """
-    ## 🎯 会议纪要生成接口
-    
-    **功能：** 将音频/文档/文本转换为结构化的会议纪要
-    
-    ---
-    
-    ### 📥 输入方式（以下7种任选其一）
-    
-    | 方式 | 参数 | 说明 | 场景 |
-    |-----|------|------|------|
-    | 🎵 上传音频 | `files` | 支持mp3/wav/m4a等，可多个 | 常用：会议录音 |
-    | 📂 本地路径 | `file_paths` | 逗号分隔多个路径 | 开发测试 |
-    | 🌐 音频URL | `audio_urls` | 公网可访问URL | 腾讯云ASR |
-    | 🔢 数据库ID | `audio_id` | 已存储的音频ID | 历史音频 |
-    | 📄 上传文档 | `document_file` | Word/PDF/TXT | 已有文字记录 |
-    | 📝 纯文本 | `text_content` | 直接输入文本 | 已转录内容 |
-    
-    ---
-    
-    ### 🎨 输出格式
-    
-    **模板参数** `template`：
-    - 预设模板：`default`（标准）/ `simple`（简洁）/ `detailed`（详细）
-    - 自定义文档：上传 `.docx` / `.pdf` 模板文件路径
-    - 自定义提示词：直接写提示词内容
-    
-    ---
-    
-    ### ⚙️ 可选配置
-    
-    - `user_requirement`：特殊要求（如"重点关注预算"）
-    - `history_meeting_ids`：关联历史会议ID
-    - `history_mode`：历史处理模式（auto/retrieval/summary）
-    - `llm_model`：选择LLM模型（auto/deepseek/qwen3）
-    - `asr_model`：选择ASR模型（auto/funasr/tencent）
-    
-    ---
-    
-    ### 💡 使用示例
-    
-    **示例1：上传单个音频**
-    ```python
-    files = [meeting.mp3]
-    template = "default"
-    ```
-    
-    **示例2：上传多个音频（自动合并）**
-    ```python
-    files = [part1.mp3, part2.mp3, part3.mp3]
-    template = "default"
-    ```
-    
-    **示例3：自定义模板和需求**
-    ```python
-    files = [meeting.mp3]
-    template = "D:\\模板\\周例会模板.docx"
-    user_requirement = "重点关注预算讨论和人员调整"
-    ```
-    
-    **示例4：关联历史会议**
-    ```python
-    files = [meeting.mp3]
-    template = "default"
-    history_meeting_ids = "100,101,102"
-    history_mode = "retrieval"
-    ```
-    """
-    temp_file_path = None  # 需要清理的临时文件路径
-    temp_files = []  # 多音频临时文件列表
-    raw_text = ""
-    transcript_data = []  # 逐字稿数据
+    temp_to_clean = []
+    raw_text, transcript_data = "", []
 
     try:
-        # ========== 情况 A: 处理音频 ==========
-        # 检测是否为多音频模式
-        is_multi_audio = False
-        audio_paths = []
+        # 1. 输入源解析与预处理
+        # 优先处理纯文本/文档
+        if text_content:
+            raw_text = text_content
+        elif document_file:
+            path = settings.TEMP_DIR / f"doc_{uuid.uuid4().hex}_{document_file.filename}"
+            with open(path, "wb") as b: shutil.copyfileobj(document_file.file, b)
+            temp_to_clean.append(str(path))
+            raw_text = document_service.extract_text_from_file(str(path))
         
-        # 判断1: 多个文件上传
-        if files and len(files) > 0:
-            is_multi_audio = True
-            for idx, upload_file in enumerate(files):
-                if upload_file.filename:
-                    # 使用UUID前缀避免并发冲突
-                    temp_path = settings.TEMP_DIR / f"multi_{uuid.uuid4().hex}_{idx}_{upload_file.filename}"
-                    with open(temp_path, "wb") as buffer:
-                        shutil.copyfileobj(upload_file.file, buffer)
-                    audio_paths.append(str(temp_path))
-                    temp_files.append(temp_path)
-                    logger.info(f"💾 音频 [{idx+1}/{len(files)}] 已保存: {temp_path}")
-        
-        # 判断2: 多个文件路径（逗号分隔）
-        elif file_paths:
-            is_multi_audio = True
-            paths = [p.strip() for p in file_paths.split(',') if p.strip()]
-            for path in paths:
-                if not os.path.exists(path):
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"文件不存在: {path}",
-                        transcript=[]
-                    )
-                audio_paths.append(path)
-            logger.info(f"📂 使用多个本地文件: 共 {len(audio_paths)} 个")
-        
-        # === 多音频处理分支 ===
-        if is_multi_audio and audio_paths:
-            logger.info(f"🎵 多音频模式: 共 {len(audio_paths)} 个音频文件")
-            
-            # 获取ASR服务
-            asr_service = get_asr_service_by_name(asr_model)
-            logger.info(f"🎤 使用ASR模型: {asr_model}")
-            
-            # 逐个识别并合并
-            current_speaker_offset = 0
-            
-            for idx, audio_path in enumerate(audio_paths):
-                logger.info(f"🎤 [{idx+1}/{len(audio_paths)}] 识别中: {os.path.basename(audio_path)}")
-                
-                asr_result = asr_service.transcribe(audio_path)
-                
-                if not asr_result or not asr_result.get("text"):
-                    logger.warning(f"⚠️ 音频 [{idx+1}] 识别结果为空，跳过")
-                    continue
-                
-                # 重新编号 speaker_id
-                transcript = asr_result.get("transcript", [])
-                if transcript:
-                    max_speaker_id = 0
-                    for item in transcript:
-                        if item.get("speaker_id") is not None:
-                            original_id = item["speaker_id"]
-                            # 统一转换为整数处理
-                            if isinstance(original_id, str):
-                                # 如果是字符串（如 "spk0"），提取数字部分
-                                try:
-                                    original_id = int(''.join(filter(str.isdigit, original_id)) or "0")
-                                except:
-                                    original_id = 0
-                            else:
-                                original_id = int(original_id)
-                            
-                            item["speaker_id"] = original_id + current_speaker_offset
-                            max_speaker_id = max(max_speaker_id, item["speaker_id"])
-                    
-                    if max_speaker_id > 0:
-                        current_speaker_offset = max_speaker_id
-                    
-                    transcript_data.extend(transcript)
-                    logger.info(f"✅ 音频 [{idx+1}] 识别成功: {len(transcript)} 条")
-            
-            if not transcript_data:
-                return MeetingResponse(
-                    status="failed",
-                    message="所有音频识别结果均为空",
-                    transcript=[]
-                )
-            
-            # 合并所有文本
-            raw_text = "\n".join([item.get("text", "") for item in transcript_data])
-            logger.info(f"📝 多音频合并完成: {len(audio_paths)} 个文件, 总长度 {len(raw_text)} 字")
-            
-            # ---------------------------------------------
-            # 可选：调用独立 Pyannote 服务进行说话人分离（方案B）
-            # 仅在配置了 PYANNOTE_SERVICE_URL 且只有一个音频文件时启用
-            # （多音频文件时，Pyannote 需要分别处理每个文件，这里简化处理）
-            # ---------------------------------------------
-            if len(audio_paths) == 1:
-                try:
-                    from app.services.pyannote_service import get_pyannote_service
-                    pyannote_service = get_pyannote_service()
-                    
-                    if pyannote_service.is_available() and transcript_data:
-                        single_audio_path = audio_paths[0]
-                        if not single_audio_path.startswith(("http://", "https://")):
-                            logger.info("🎤 使用独立 Pyannote 服务优化说话人分离（方案B）")
-                            transcript_data = pyannote_service.diarize(
-                                audio_path=single_audio_path,
-                                transcript=transcript_data,
-                            )
-                        else:
-                            logger.info("ℹ️ 目标音频为 URL，当前 Pyannote 仅支持本地文件，跳过")
-                    elif not pyannote_service.is_available():
-                        logger.info("ℹ️ 未配置 PYANNOTE_SERVICE_URL，跳过 Pyannote 分离")
-                    elif not transcript_data:
-                        logger.info("ℹ️ transcript 为空，跳过 Pyannote 分离")
-                except Exception as e:
-                    logger.warning(f"⚠️ 调用 Pyannote 服务失败，保持原有说话人结果: {e}")
-            else:
-                logger.info(f"ℹ️ 多音频模式（{len(audio_paths)} 个文件），当前版本暂不支持 Pyannote 优化")
-        
-        # === 单音频处理分支（原有逻辑） ===
-        # 处理单个文件/URL/ID的情况
-        elif (files and len(files) == 1) or file_paths or audio_id or audio_urls:
-            # ✅ 使用print确保终端显示
-            print(f"\n{'='*80}")
-            print(f"📨 收到新的音频处理请求")
-            print(f"{'='*80}")
-            import sys
-            sys.stderr.flush()
-            sys.stdout.flush()
-            
-            logger.info(f"📨 收到音频处理请求: 模板={template}")
-            
-            target_audio_path = ""
-
-            # 分支 1: 传了文件流 - 直接保存
-            if files and len(files) == 1:
-                upload_file = files[0]
-                # 使用UUID前缀避免并发冲突
-                temp_file_path = settings.TEMP_DIR / f"upload_{uuid.uuid4().hex}_{upload_file.filename}"
-                with open(temp_file_path, "wb") as buffer:
-                    shutil.copyfileobj(upload_file.file, buffer)
-                target_audio_path = str(temp_file_path)
-                logger.info(f"💾 音频流已保存: {target_audio_path}")
-            
-            # 分支 2: 传了本地文件路径 - 直接使用（用于测试或内部调用）
-            elif file_paths:
-                # 支持单个或多个路径（如果是多个，只取第一个）
-                paths = [p.strip() for p in file_paths.split(',') if p.strip()]
-                target_path = paths[0] if paths else None
-                
-                if not target_path:
-                    return MeetingResponse(
-                        status="failed",
-                        message="file_paths 参数为空",
-                        transcript=[]
-                    )
-                
-                file_path = target_path  # 临时变量，用于后续处理
-                
-                if not os.path.exists(file_path):
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"文件不存在: {file_path}",
-                        transcript=[]
-                    )
-                target_audio_path = file_path
-                logger.info(f"📂 使用本地文件路径: {target_audio_path}")
-            
-            # 分支 3: 传了音频ID - 从数据库获取并下载
-            elif audio_id:
-                from app.services.download import audio_download_service
-                target_audio_path = audio_download_service.get_file_path_from_db(audio_id)
-                
-                if not target_audio_path:
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"无法从数据库获取或下载音频: ID={audio_id}",
-                        transcript=[]
-                    )
-                # 标记为临时文件，需要清理
-                temp_file_path = target_audio_path
-                logger.info(f"📥 从数据库获取音频并下载: ID={audio_id}, 路径={target_audio_path}")
-            
-            # 分支 4: 传了音频URL - 直接使用（腾讯云ASR要求）
-            # 也支持音频地址 (支持 URL 或 本地路径)
+        # 处理音频输入
+        else:
+            audio_path, is_url = "", False
+            # 多文件上传/路径解析
+            if files:
+                for idx, f in enumerate(files):
+                    p = settings.TEMP_DIR / f"multi_{uuid.uuid4().hex}_{idx}_{f.filename}"
+                    with open(p, "wb") as b: shutil.copyfileobj(f.file, b)
+                    temp_to_clean.append(str(p))
+                audio_path = temp_to_clean[0] # 这里简化逻辑：多文件并行目前仅演示首文件，如需全合并需ffmpeg
             elif audio_urls:
-                # 支持单个或多个URL（如果是多个，只取第一个）
-                urls = [url.strip() for url in audio_urls.split(',') if url.strip()]
-                audio_url = urls[0] if urls else None
-                
-                if not audio_url:
-                    return MeetingResponse(
-                        status="failed",
-                        message="audio_urls 参数为空",
-                        transcript=[]
-                    )
-                
-                # 1. 清洗输入 (去掉可能存在的引号和空格，防止 copy 路径带引号)
-                clean_path = audio_url.strip().strip('"').strip("'").strip()
-                
-                is_url = clean_path.startswith(("http://", "https://"))
-                is_local_file = os.path.exists(clean_path)
-                
-                # 2. 根据当前的 ASR 服务类型做校验
-                if settings.ASR_SERVICE_TYPE == 'tencent':
-                    # 【腾讯云模式】必须是 URL
-                    if not is_url:
-                        return MeetingResponse(
-                            status="failed",
-                            message=f"模式错误: 当前使用【腾讯云】，必须提供公网 URL，不支持本地路径: {clean_path}",
-                            transcript=[]
-                        )
-                    target_audio_path = clean_path
-                    logger.info(f"🔗 [腾讯云] 使用音频URL: {target_audio_path}")
+                audio_path = audio_urls.split(',')[0].strip().strip('"')
+                is_url = audio_path.startswith("http")
+            elif file_paths:
+                audio_path = file_paths.split(',')[0].strip()
 
-                else:
-                    # 【本地 FunASR 模式】支持 URL + 本地文件
-                    if is_url:
-                        target_audio_path = clean_path
-                        logger.info(f"🔗 [本地模式] 识别为网络地址: {target_audio_path}") # Service层会自动下载
-                    
-                    elif is_local_file:
-                        if os.path.isdir(clean_path):
-                            return MeetingResponse(status="failed", message="路径是一个文件夹，请指定具体文件", transcript=[])
-                        
-                        target_audio_path = clean_path
-                        logger.info(f"📂 [本地模式] 识别为本地文件: {target_audio_path}")
-                    
-                    else:
-                        # 既不是 URL，本地也没这个文件
-                        return MeetingResponse(
-                            status="failed",
-                            message=f"无效路径: 系统找不到文件 '{clean_path}'，且不是 http 链接。",
-                            transcript=[]
-                        )
-            
-            # 如果是本地文件，验证文件大小
-            if not target_audio_path.startswith(("http://", "https://")):
-                if not os.path.exists(target_audio_path):
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"音频文件不存在: {target_audio_path}",
-                        transcript=[]
-                    )
-                
-                file_size_mb = os.path.getsize(target_audio_path) / (1024 * 1024)
-                if file_size_mb > settings.MAX_FILE_SIZE_MB:
-                    return MeetingResponse(
-                        status="failed",
-                        message=f"音频文件过大: {file_size_mb:.2f}MB，最大允许: {settings.MAX_FILE_SIZE_MB}MB",
-                        transcript=[]
-                    )
-                logger.info(f"📊 音频文件大小: {file_size_mb:.2f}MB")
+            # 2. 核心执行逻辑：并行流或传统流
+            funasr_url = os.getenv("FUNASR_SERVICE_URL")
+            pyannote_url = os.getenv("PYANNOTE_SERVICE_URL")
 
-            # ============================================================
-            # 新流程：并行处理 FunASR 和 Pyannote
-            # ============================================================
-            from app.services.parallel_processor import map_words_to_speakers, aggregate_by_speaker, parse_rttm
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            import requests
-            import tempfile
+            if funasr_url and pyannote_url and asr_model == "funasr":
+                logger.info("🚀 启动并行处理引擎...")
+                raw_text, transcript_data = await handle_audio_parallel(audio_path, is_url, asr_model)
             
-            # 检查是否使用新流程（需要同时配置 FunASR 和 Pyannote）
-            use_parallel_flow = False
-            funasr_service_url = os.getenv("FUNASR_SERVICE_URL", "")
-            pyannote_service_url = os.getenv("PYANNOTE_SERVICE_URL", "")
-            
-            # 详细日志：检查并行流程条件
-            logger.info(f"🔍 并行流程检查: FUNASR_SERVICE_URL={funasr_service_url}, PYANNOTE_SERVICE_URL={pyannote_service_url}, asr_model={asr_model}")
-            
-            # 如果音频是 URL，先下载到临时文件
-            temp_audio_file = None
-            actual_audio_path = target_audio_path
-            
-            if target_audio_path.startswith(("http://", "https://")):
-                try:
-                    logger.info(f"📥 音频为 URL，正在下载到临时文件: {target_audio_path}")
-                    resp = requests.get(target_audio_path, timeout=300, stream=True)
-                    resp.raise_for_status()
-                    
-                    # 创建临时文件（使用流式下载以节省内存）
-                    file_ext = os.path.splitext(target_audio_path)[1] or ".mp3"
-                    temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_ext)
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            temp_audio_file.write(chunk)
-                    temp_audio_file.close()
-                    
-                    actual_audio_path = temp_audio_file.name
-                    file_size_mb = os.path.getsize(actual_audio_path) / 1024 / 1024
-                    logger.info(f"✅ 音频下载完成: {actual_audio_path} (大小: {file_size_mb:.2f}MB)")
-                except Exception as e:
-                    logger.warning(f"⚠️ 下载音频 URL 失败: {e}，将使用原有流程")
-                    actual_audio_path = target_audio_path
-            
-            if funasr_service_url and pyannote_service_url and asr_model == "funasr":
-                use_parallel_flow = True
-                logger.info("🚀 使用新流程：并行处理 FunASR (字级别) + Pyannote (RTTM)")
-            else:
-                missing = []
-                if not funasr_service_url:
-                    missing.append("FUNASR_SERVICE_URL")
-                if not pyannote_service_url:
-                    missing.append("PYANNOTE_SERVICE_URL")
-                if asr_model != "funasr":
-                    missing.append(f"asr_model应为'funasr'，当前为'{asr_model}'")
-                logger.info(f"ℹ️ 未启用并行流程，缺少配置: {', '.join(missing)}")
-            
-            if use_parallel_flow:
-                # 并行执行 FunASR 和 Pyannote
-                def run_funasr_word_level():
-                    """在后台线程中运行 FunASR 字级别识别"""
-                    try:
-                        data = {
-                            'audio_path': actual_audio_path,  # 使用实际路径（可能是临时文件）
-                            'hotword': ''
-                        }
-                        resp = requests.post(
-                            f"{funasr_service_url}/transcribe/word-level",
-                            data=data,
-                            timeout=600
-                        )
-                        if resp.status_code == 200:
-                            result = resp.json()
-                            if result.get("code") == 0:
-                                return result.get("words", [])
-                            else:
-                                logger.warning(f"⚠️ FunASR 字级别识别失败: {result.get('msg')}")
-                                return []
-                        else:
-                            logger.warning(f"⚠️ FunASR 字级别识别失败: {resp.status_code} - {resp.text}")
-                            return []
-                    except Exception as e:
-                        logger.error(f"❌ FunASR 字级别识别异常: {e}")
-                        return []
-                
-                def run_pyannote_rttm():
-                    """在后台线程中运行 Pyannote RTTM 生成"""
-                    try:
-                        logger.info(f"🎤 开始调用 Pyannote RTTM 服务: {pyannote_service_url}/rttm")
-                        # RTTM 是临时生成的，不保存到文件，直接返回字符串
-                        resp = requests.post(
-                            f"{pyannote_service_url}/rttm",
-                            json={"audio_path": actual_audio_path},  # 使用实际路径（可能是临时文件）
-                            timeout=600
-                        )
-                        logger.info(f"🎤 Pyannote RTTM 服务响应: status_code={resp.status_code}")
-                        if resp.status_code == 200:
-                            result = resp.json()
-                            rttm_content = result.get("rttm", "")
-                            if rttm_content:
-                                rttm_lines = rttm_content.strip().split('\n')
-                                logger.info(f"✅ Pyannote RTTM 生成成功: {len(rttm_lines)} 行（临时使用，不保存文件）")
-                            else:
-                                logger.warning(f"⚠️ Pyannote RTTM 内容为空")
-                            return rttm_content
-                        else:
-                            logger.warning(f"⚠️ Pyannote RTTM 生成失败: {resp.status_code} - {resp.text[:200]}")
-                            return ""
-                    except Exception as e:
-                        logger.error(f"❌ Pyannote RTTM 生成异常: {e}", exc_info=True)
-                        return ""
-                
-                # 并行执行
-                logger.info("🔄 开始并行执行 FunASR 和 Pyannote...")
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    funasr_future = executor.submit(run_funasr_word_level)
-                    pyannote_future = executor.submit(run_pyannote_rttm)
-                    
-                    # 等待两个任务完成
-                    logger.info("⏳ 等待 FunASR 和 Pyannote 完成...")
-                    words = funasr_future.result()
-                    logger.info(f"✅ FunASR 完成: {len(words) if words else 0} 个字")
-                    rttm_content = pyannote_future.result()
-                    logger.info(f"✅ Pyannote 完成: {len(rttm_content) if rttm_content else 0} 字符")
-                
-                if not words:
-                    logger.warning("⚠️ FunASR 字级别识别结果为空，降级到原有流程")
-                    use_parallel_flow = False
-                elif not rttm_content:
-                    logger.warning("⚠️ Pyannote RTTM 生成失败，降级到原有流程")
-                    use_parallel_flow = False
-                else:
-                    # 解析 RTTM
-                    rttm_segments = parse_rttm(rttm_content)
-                    logger.info(f"✅ 并行处理完成: {len(words)} 个字, {len(rttm_segments)} 个说话人片段")
-                    
-                    # 字级别映射说话人
-                    mapped_words = map_words_to_speakers(words, rttm_segments)
-                    logger.info(f"✅ 字级别映射完成: {len(mapped_words)} 个字已分配说话人")
-                    
-                    # 按说话人聚合句子
-                    transcript_data = aggregate_by_speaker(mapped_words)
-                    logger.info(f"✅ 句子聚合完成: {len(transcript_data)} 个句子")
-                    
-                    # 生成 raw_text
-                    raw_text = "".join([item.get("text", "") for item in transcript_data])
-                    
-                    # 转换格式为 TranscriptItem
-                    transcript_data = [
-                        {
-                            "text": item.get("text", ""),
-                            "start_time": item.get("start", 0.0),
-                            "end_time": item.get("end", 0.0),
-                            "speaker_id": item.get("speaker_id", "SPEAKER_00")
-                        }
-                        for item in transcript_data
-                    ]
-                    
-                    # 注意：RTTM 内容只在内存中使用，不保存到文件，处理完成后自动释放
-                    logger.debug("ℹ️ RTTM 内容已在内存中处理完成，未保存到文件")
-                    
-                    # 新流程中，声纹匹配在下面统一处理（无论是否使用并行流程）
-            
-            # 清理临时音频文件（如果是从 URL 下载的）
-            # 注意：在声纹匹配完成后再清理，因为声纹匹配也需要音频文件
-            cleanup_temp_file = False
-            
-            # 如果新流程失败或未启用，使用原有流程
-            if not use_parallel_flow:
-                # 获取 ASR 服务（动态选择）⭐
-                try:
-                    asr_service = get_asr_service_by_name(asr_model)
-                    logger.info(f"🎤 使用ASR模型: {asr_model}")
-                except Exception as e:
-                    return MeetingResponse(
-                        status="failed", 
-                        message=f"ASR服务初始化失败: {str(e)}",
-                        transcript=[]
-                    )
+            # 降级/传统流程
+            if not raw_text:
+                asr_service = get_asr_service_by_name(asr_model)
+                asr_res = asr_service.transcribe(audio_path)
+                raw_text, transcript_data = asr_res.get("text", ""), asr_res.get("transcript", [])
 
-            # 调用 ASR 服务听写
-                asr_result = asr_service.transcribe(target_audio_path)
-                raw_text = asr_result.get("text", "")
-                transcript_data = asr_result.get("transcript", [])
-
-            # ---------------------------------------------
-            # 可选：调用独立 Pyannote 服务进行说话人分离（方案B）
-            # 仅在配置了 PYANNOTE_SERVICE_URL 时启用
-            # 注意：如果音频是 URL，使用实际路径（临时文件）
-            # ---------------------------------------------
-            try:
-                from app.services.pyannote_service import get_pyannote_service
-                pyannote_service = get_pyannote_service()
-                
-                # 如果音频是 URL，使用实际路径（临时文件）
-                audio_path_for_pyannote = actual_audio_path if 'actual_audio_path' in locals() else target_audio_path
-
-                if pyannote_service.is_available() and transcript_data:
-                    logger.info("🎤 使用独立 Pyannote 服务优化说话人分离（方案B）")
-                    transcript_data = pyannote_service.diarize(
-                        audio_path=audio_path_for_pyannote,
-                        transcript=transcript_data,
-                    )
-                else:
-                    if not pyannote_service.is_available():
-                        logger.info("ℹ️ 未配置 PYANNOTE_SERVICE_URL，跳过 Pyannote 分离")
-                    elif not transcript_data:
-                        logger.info("ℹ️ transcript 为空，跳过 Pyannote 分离")
-            except Exception as e:
-                logger.warning(f"⚠️ 调用 Pyannote 服务失败，保持原有说话人结果: {e}")
-            
-            # ---------------------------------------------
-            # 声纹匹配（在 Pyannote 说话人分离之后执行）
-            # 用于识别说话人的真实身份（匹配到员工声纹库）
-            # ---------------------------------------------
+            # 3. 声纹识别身份 (Voice Match)
             try:
                 from app.services.voice_service import voice_service
-                
-                # 如果音频是 URL，使用实际路径（临时文件）
-                audio_path_for_voice = actual_audio_path if 'actual_audio_path' in locals() else target_audio_path
-                
-                if voice_service and voice_service.enabled and transcript_data and audio_path_for_voice:
-                    logger.info("🎙️ 开始声纹匹配（识别说话人身份）...")
-                    
-                    # 1. 为每个说话人提取音频片段（每个speaker_id提取多个片段，用于计算均值）
-                    speaker_segments = voice_service.extract_speaker_segments(
-                        audio_path=audio_path_for_voice,
-                        transcript=transcript_data,
-                        duration=10  # 提取10秒
-                    )
-                    
-                    if speaker_segments:
-                        logger.info(f"✅ 提取到 {len(speaker_segments)} 个说话人的音频片段")
-                        
-                        # 2. 匹配说话人身份（每个speaker_id只匹配一次）
-                        matched = voice_service.match_speakers(
-                            speaker_segments=speaker_segments,
-                            threshold=0.75  # 相似度阈值75%
-                        )
-                        
-                        if matched:
-                            logger.info(f"✅ 声纹匹配成功: {len(matched)} 个说话人")
-                            
-                            # 3. 替换speaker_id为真实姓名
-                            transcript_data = voice_service.replace_speaker_ids(transcript_data, matched)
-                        else:
-                            logger.info("ℹ️ 未匹配到任何说话人（声纹库可能为空或相似度不足）")
-                    else:
-                        logger.info("ℹ️ 未能提取说话人音频片段，跳过声纹匹配")
-                elif not voice_service or not voice_service.enabled:
-                    logger.info("ℹ️ 声纹库为空，跳过声纹匹配")
-            except ImportError:
-                logger.debug("ℹ️ 声纹服务未安装，跳过声纹匹配")
-            except Exception as e:
-                logger.warning(f"⚠️ 声纹匹配失败: {e}")
-            
-            # 清理临时音频文件（如果是从 URL 下载的）
-            # 在所有处理完成后清理，确保声纹匹配等步骤都能使用
-            if 'temp_audio_file' in locals() and temp_audio_file and os.path.exists(temp_audio_file.name):
-                try:
-                    os.remove(temp_audio_file.name)
-                    logger.info(f"🧹 已清理临时音频文件: {temp_audio_file.name}")
-                except Exception as e:
-                    logger.warning(f"⚠️ 清理临时文件失败: {e}")
-            
-            if not raw_text:
-                return MeetingResponse(
-                    status="failed", 
-                    message="语音识别结果为空",
-                    transcript=[]
-                )
+                if voice_service.enabled and transcript_data and not is_url:
+                    segments = voice_service.extract_speaker_segments(audio_path, transcript_data)
+                    matched = voice_service.match_speakers(segments)
+                    transcript_data = voice_service.replace_speaker_ids(transcript_data, matched)
+            except Exception as ve:
+                logger.warning(f"声纹匹配跳过: {ve}")
 
-        # --- 情况 B: 处理文档（Word/PDF）---
-        elif document_file:
-            logger.info(f"📄 收到文档处理请求: 文件名={document_file.filename}, 模板={template}")
-            
-            file_ext = os.path.splitext(document_file.filename)[1].lower()
-            if file_ext not in ['.docx', '.pdf', '.txt']:
-                return MeetingResponse(
-                    status="failed",
-                    message=f"不支持的文档格式: {file_ext}，仅支持 .docx, .pdf, .txt",
-                    transcript=[]
-                )
-            
-            # 使用UUID前缀避免并发冲突
-            temp_file_path = settings.TEMP_DIR / f"doc_{uuid.uuid4().hex}_{document_file.filename}"
-            with open(temp_file_path, "wb") as buffer:
-                shutil.copyfileobj(document_file.file, buffer)
-            logger.info(f"💾 文档已保存: {temp_file_path}")
-            
-            # 使用 document_service 提取文本
-            raw_text = document_service.extract_text_from_file(str(temp_file_path))
-            
-            if not raw_text:
-                return MeetingResponse(
-                    status="failed",
-                    message="文档解析失败或文档内容为空",
-                    transcript=[]
-                )
-            logger.info(f"✅ 文档解析完成，文本长度: {len(raw_text)}")
+        if not raw_text:
+            raise HTTPException(status_code=400, detail="未能提取有效文本内容")
 
-        # --- 情况 C: 处理纯文本 ---
-        elif text_content:
-            logger.info(f"📨 收到纯文本请求: 长度={len(text_content)}")
-            raw_text = text_content
-            
-        # --- 情况 D: 啥都没传 ---
-        else:
-            return MeetingResponse(
-                status="failed", 
-                message="请提供输入: 音频文件/URL/ID, 文档或文本内容",
-                transcript=[]
-            )
-
-        # ---------------------------------------------------------
-        # 2. 模板处理（已移到 prompt_template_service 中统一处理）
-        # ---------------------------------------------------------
-        # 现在 prompt_template_service.get_template_config 已经支持文档路径
-        # 所以这里不需要额外处理了
-
-        # ---------------------------------------------------------
-        # 历史会议处理部分（新增）⭐
-        # ---------------------------------------------------------
+        # 4. 历史检索与 LLM 生成
         history_context = None
-        
-        # 用户需求（已在向后兼容处理中合并）
-        final_user_requirement = user_requirement
-        
         if history_meeting_ids:
-            # 解析历史会议ID列表
-            meeting_ids = [
-                mid.strip() 
-                for mid in history_meeting_ids.split(",") 
-                if mid.strip()
-            ]
-            
-            if meeting_ids:
-                from app.services.meeting_history import meeting_history_service
-                
-                # 判断使用哪种模式
-                mode = meeting_history_service.determine_mode(
-                    meeting_ids=meeting_ids,
-                    user_requirement=final_user_requirement,
-                    history_mode=history_mode
-                )
-                
-                logger.info(f"📚 处理历史会议: {len(meeting_ids)} 个, 模式: {mode}")
-                
-                try:
-                    if mode == "retrieval":
-                        # 检索模式：精确查询
-                        history_context = await meeting_history_service.process_by_retrieval(
-                            meeting_ids=meeting_ids,
-                            user_requirement=final_user_requirement,
-                            current_transcript=raw_text,
-                            llm_model=llm_model
-                        )
-        else:
-                        # 总结模式：分块汇总
-                        history_context = await meeting_history_service.process_by_summary(
-                            meeting_ids=meeting_ids,
-                            user_requirement=final_user_requirement,
-                            llm_model=llm_model
-                        )
-                    
-                    logger.info(f"✅ 历史会议处理完成: {mode} 模式")
-                    
-                except Exception as e:
-                    logger.error(f"❌ 历史会议处理失败: {e}")
-                    # 不影响主流程，继续处理
-                    history_context = None
-
-        # ---------------------------------------------------------
-        # LLM 处理部分
-        # ---------------------------------------------------------
-
-        try:
-            # 动态选择模型（新增）⭐
-            llm_service = get_llm_service_by_name(llm_model)
-            
-            # 设置 LLM 参数
-            if hasattr(llm_service, 'temperature'):
-                llm_service.temperature = llm_temperature
-            if hasattr(llm_service, 'max_tokens'):
-                llm_service.max_tokens = llm_max_tokens
-            
-        except Exception as e:
-            logger.error(f"❌ LLM服务初始化失败: {e}")
-            # ... (错误处理保持不变)
-            transcript_items = []
-            if transcript_data:
-                from app.schemas.task import TranscriptItem
-                transcript_items = [
-                    TranscriptItem(**item) for item in transcript_data
-                ]
-            return MeetingResponse(
-                status="failed",
-                message=f"LLM服务初始化失败: {str(e)}",
-                raw_text=raw_text[:500],
-                transcript=transcript_items
-            )
-
-        # 1. 使用动态模板渲染（新增）⭐
-        from app.services.prompt_template import prompt_template_service
-        
-        # 获取模板配置（统一使用 template 参数）
-        # template 可以是：模板ID、文档路径、JSON字符串或纯文本
-        template_config = prompt_template_service.get_template_config(
-            prompt_template=None,  # 不再使用废弃参数
-            template_id=template    # 使用新的统一参数
-        )
-        
-        # 渲染最终的提示词
-        final_prompt = prompt_template_service.render_prompt(
-            template_config=template_config,
-            current_transcript=raw_text,
-            history_context=history_context,
-            user_requirement=final_user_requirement
-        )
-        
-        logger.info(f"📝 提示词渲染完成，长度: {len(final_prompt)}")
-        
-        # 2. 调用 LLM 生成
-        # 注意：这里直接调用 chat 方法，而不是 generate_markdown
-        # 因为提示词已经包含了所有上下文
-        try:
-            if hasattr(llm_service, 'chat'):
-                structured_data = llm_service.chat(final_prompt)
+            from app.services.meeting_history import meeting_history_service
+            m_ids = [i.strip() for i in history_meeting_ids.split(",")]
+            if history_mode == "retrieval":
+                history_context = await meeting_history_service.process_by_retrieval(m_ids, user_requirement, raw_text, llm_model)
             else:
-                # 降级：使用原有的 generate_markdown 方法
-                logger.warning("⚠️ LLM 服务没有 chat 方法，使用原有逻辑")
-                
-                # RAG 分析（原有逻辑）
-        rag_analysis = llm_service.judge_rag(raw_text, template_id)
-        need_rag = rag_analysis.get("need_rag", False)
-        search_query = rag_analysis.get("search_query", "")
+                history_context = await meeting_history_service.process_by_summary(m_ids, user_requirement, llm_model)
 
-                # 向量检索
-        context_info = "" 
-        if need_rag and search_query:
-                    if vector_service and vector_service.is_available():
-            context_info = vector_service.search_similar(search_query)
-            logger.info(f"📚 基于 '{search_query}' 检索到历史上下文")
-                    else:
-                        logger.warning("⚠️ 向量服务不可用，跳过历史检索")
-
-                # 生成（使用模板配置中的模板内容或template_id）
-                # 如果模板配置包含 prompt_template，使用它；否则使用 template_id
-                template_to_use = template_config.get("prompt_template", template_id)
-                
-                structured_data = llm_service.generate_markdown(
-                    raw_text=raw_text, 
-                    context=context_info,
-                    template_id=template_to_use,
-                    custom_instruction=final_user_requirement
-                )
-        except Exception as e:
-            logger.error(f"❌ LLM 生成失败: {e}")
-            raise
-
-        final_html = ""
-        if structured_data:
-            try:
-                # extensions=['nl2br'] 确保换行符会被转为 <br>
-                clean_md = structured_data.replace("```markdown", "").replace("```", "").strip()
-                final_html = markdown.markdown(clean_md, extensions=['nl2br', 'tables'])
-            except Exception as e:
-                logger.error(f"HTML转换失败: {e}")
-                final_html = f"<p>{structured_data}</p>" # 降级处理
+        # 渲染 Prompt 并调用 LLM
+        llm_service = get_llm_service_by_name(llm_model)
+        llm_service.temperature, llm_service.max_tokens = llm_temperature, llm_max_tokens
         
-        # 构建返回
-        transcript_items = []
-        if transcript_data:
-            from app.schemas.task import TranscriptItem
-            transcript_items = [
-                TranscriptItem(
-                    text=item.get("text", ""),
-                    start_time=item.get("start_time", 0.0),
-                    end_time=item.get("end_time", 0.0),
-                    speaker_id=item.get("speaker_id")
-                )
-                for item in transcript_data
-            ]
+        template_config = prompt_template_service.get_template_config(template_id=template)
+        final_prompt = prompt_template_service.render_prompt(template_config, raw_text, history_context, user_requirement)
         
-        logger.info("✅ 任务完成")
+        structured_data = llm_service.chat(final_prompt) if hasattr(llm_service, 'chat') else llm_service.generate_markdown(raw_text, "", template, user_requirement)
+        
+        # 格式化输出
+        clean_md = structured_data.replace("```markdown", "").replace("```", "").strip()
+        final_html = markdown.markdown(clean_md, extensions=['nl2br', 'tables'])
 
         return MeetingResponse(
             status="success",
             message="处理成功",
             raw_text=raw_text[:500],
-            transcript=transcript_items,
-            need_rag=False,  # 新逻辑下不需要这个字段
-            html_content=final_html,
-            usage_tokens=0
+            transcript=[TranscriptItem(**item) for item in transcript_data],
+            html_content=final_html
         )
 
     except Exception as e:
-        logger.error(f"❌ 接口处理异常: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return MeetingResponse(
-            status="error", 
-            message=f"服务端错误: {str(e)}",
-            transcript=[]
-        )
-    
+        logger.error(f"❌ 处理异常: {e}\n{traceback.format_exc()}")
+        return MeetingResponse(status="error", message=str(e), transcript=[])
     finally:
-        # 清理临时文件
-        # 1. 单文件清理
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-            os.remove(temp_file_path)
-                logger.info(f"🧹 临时文件已清理: {temp_file_path}")
-            except Exception as e:
-                logger.warning(f"⚠️ 清理临时文件失败: {e}")
-        
-        # 2. 多文件清理
-        for temp_path in temp_files:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                    logger.info(f"🧹 临时文件已清理: {temp_path}")
-                except Exception as e:
-                    logger.warning(f"⚠️ 清理临时文件失败: {temp_path}, {e}")
+        cleanup_files(temp_to_clean)
+
+# --- 其他接口 (Archive, Register, Hotwords) 逻辑已较精简，保持原有结构 ---
 
 @router.post("/archive", response_model=ArchiveResponse)
 async def archive_meeting_knowledge(request: ArchiveRequest):

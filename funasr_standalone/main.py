@@ -1315,7 +1315,17 @@ async def transcribe(
                         "speaker_id": "1"
                     })
 
-        logger.info(f"✅ 识别成功: {file.filename} (长度: {len(full_text)}字)")
+        # 根据输入来源构造日志描述（file 可能为 None，例如通过 audio_url 调用时）
+        if file is not None and getattr(file, "filename", None):
+            src_desc = file.filename
+        elif isinstance(input_data, str) and input_data.startswith(("http://", "https://")):
+            src_desc = input_data
+        elif isinstance(input_data, str):
+            src_desc = input_data
+        else:
+            src_desc = "未知来源音频"
+
+        logger.info(f"✅ 识别成功: {src_desc} (长度: {len(full_text)}字)")
         
         # ===== 热词后处理替换（SenseVoiceSmall 专用）=====
         # SenseVoiceSmall 不支持原生热词，需要在结果中进行文本替换
@@ -1374,7 +1384,16 @@ async def transcribe(
         }
 
     except Exception as e:
-        logger.error(f"❌ 识别出错: {file.filename} - {str(e)}", exc_info=True)
+        # 这里同样要考虑 file 可能为 None 的情况
+        err_src = None
+        if file is not None and getattr(file, "filename", None):
+            err_src = file.filename
+        elif "input_data" in locals():
+            err_src = str(input_data)
+        else:
+            err_src = "未知来源音频"
+
+        logger.error(f"❌ 识别出错: {err_src} - {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
         
     finally:

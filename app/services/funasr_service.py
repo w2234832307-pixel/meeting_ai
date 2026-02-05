@@ -103,41 +103,63 @@ class FunASRService:
         try:
             logger.info(f"🎤 [HTTP模式] 开始识别: {file_path}")
             start_time = time.time()
-            
-            # 检查文件是否存在
-            file_path_obj = Path(file_path)
-            if not file_path_obj.exists():
-                raise ASRServiceException(f"音频文件不存在: {file_path}")
-            
+
             # 发送请求到独立服务
             url = f"{self.service_url}/transcribe"
-            
+
             # 注意：热词现在由FunASR服务自动管理，无需在这里传递
-            
-            with open(file_path_obj, "rb") as f:
-                files = {"file": (file_path_obj.name, f, "audio/mpeg")}
+
+            # 1) URL 模式：如果 file_path 是 http(s)，走 audio_url 分支（不做本地存在性检查）
+            if str(file_path).startswith(("http://", "https://")):
                 # 检查是否配置了 Pyannote 服务
                 try:
                     from app.services.pyannote_service import get_pyannote_service
                     pyannote_service = get_pyannote_service()
                     enable_diarization = not pyannote_service.is_available()
                 except Exception:
-                    # 如果导入失败，默认启用说话人分离
                     enable_diarization = True
-                
+
                 data = {
+                    "audio_url": file_path,
                     "enable_punc": True,
                     "enable_vad": True,
-                    # 如果配置了 Pyannote 服务，禁用 FunASR 内部的说话人分离
-                    "enable_speaker_diarization": enable_diarization
+                    "enable_speaker_diarization": enable_diarization,
                 }
-                
                 response = requests.post(
                     url,
-                    files=files,
                     data=data,
                     timeout=getattr(settings, "ASR_TIMEOUT", 600)
                 )
+            else:
+                # 2) 本地文件模式：检查文件是否存在，并以上传文件形式传给独立服务
+                file_path_obj = Path(file_path)
+                if not file_path_obj.exists():
+                    raise ASRServiceException(f"音频文件不存在: {file_path}")
+
+                with open(file_path_obj, "rb") as f:
+                    files = {"file": (file_path_obj.name, f, "audio/mpeg")}
+                    # 检查是否配置了 Pyannote 服务
+                    try:
+                        from app.services.pyannote_service import get_pyannote_service
+                        pyannote_service = get_pyannote_service()
+                        enable_diarization = not pyannote_service.is_available()
+                    except Exception:
+                        # 如果导入失败，默认启用说话人分离
+                        enable_diarization = True
+
+                    data = {
+                        "enable_punc": True,
+                        "enable_vad": True,
+                        # 如果配置了 Pyannote 服务，禁用 FunASR 内部的说话人分离
+                        "enable_speaker_diarization": enable_diarization
+                    }
+
+                    response = requests.post(
+                        url,
+                        files=files,
+                        data=data,
+                        timeout=getattr(settings, "ASR_TIMEOUT", 600)
+                    )
             
             if response.status_code != 200:
                 raise ASRServiceException(f"FunASR 服务返回错误: {response.status_code} - {response.text}")

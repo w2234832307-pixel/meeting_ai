@@ -2,6 +2,53 @@ import logging
 import chromadb
 import torch
 import tempfile
+from typing import List, Dict, Tuple, Optional
+
+
+def _fix_datasets_compatibility():
+    """修复 datasets 与 modelscope 的兼容性问题（LargeList 等）"""
+    try:
+        import datasets
+
+        # 修复 LargeList（部分新版本 datasets 中已移除）
+        if not hasattr(datasets, "LargeList"):
+            try:
+                from datasets import LargeList  # 尝试直接导入（旧版本）
+            except ImportError:
+                try:
+                    import pyarrow as pa
+
+                    if hasattr(pa, "large_list"):
+                        datasets.LargeList = pa.large_list
+                    elif hasattr(pa, "LargeList"):
+                        datasets.LargeList = pa.LargeList
+                except Exception:
+                    # 如果 pyarrow 也没有对应实现，就静默跳过，让后续代码自行处理
+                    pass
+
+        # 修复 _FEATURE_TYPES（datasets 2.19+ 中可能位置变化或被移除）
+        try:
+            from datasets.features.features import _FEATURE_TYPES  # 旧位置
+        except ImportError:
+            try:
+                from datasets.features import _FEATURE_TYPES  # 尝试新位置
+            except ImportError:
+                try:
+                    import datasets.features.features as features_module
+
+                    if not hasattr(features_module, "_FEATURE_TYPES"):
+                        # 创建一个空占位符，避免 modelscope 导入时报错
+                        features_module._FEATURE_TYPES = {}
+                except Exception:
+                    pass
+    except Exception:
+        # 如果 datasets 自身都导入失败，保持原状，由上层捕获错误
+        pass
+
+
+# 必须在导入 modelscope 之前执行修复
+_fix_datasets_compatibility()
+
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
 from app.core.config import settings
