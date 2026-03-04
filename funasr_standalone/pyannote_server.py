@@ -7,12 +7,11 @@ import os
 import logging
 from typing import List, Optional
 from pathlib import Path
-
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-# 避免依赖 pyannote 内部的 AudioDecoder，手动解码音频为 waveform 传给 pipeline，绕过 AudioDecoder 报错
+import asyncio
+from fastapi import BackgroundTasks
 import torch
 import soundfile as sf
 import subprocess
@@ -359,14 +358,17 @@ async def get_rttm(
         return RTTMResponse(rttm="", error=str(e))
 
 
+gpu_semaphore = asyncio.Semaphore(2)
+
 @app.post("/diarize", response_model=DiarizeResponse)
 async def diarize(req: DiarizeRequest) -> DiarizeResponse:
     """
-    标准说话人分离接口（合并 Transcript）
+    标准说话人分离接口（合并 Transcript）- 异步防阻塞改造版
     """
     hf_token = os.getenv("HF_TOKEN") or None
     
     logger.info(f"📂 [Diarize请求] 音频: {req.audio_path}, 字幕条数: {len(req.transcript)}")
+    logger.info("⏳ 正在等待进入处理队列...")
 
     # 1. 转换为字典列表
     transcript_dicts: List[dict] = [
@@ -379,12 +381,16 @@ async def diarize(req: DiarizeRequest) -> DiarizeResponse:
         for item in req.transcript
     ]
 
-    # 2. 调用核心逻辑 (这就是我们刚才修改过的那个文件)
-    updated = perform_pyannote_diarization(
-        audio_path=req.audio_path,
-        transcript=transcript_dicts,
-        use_auth_token=hf_token,
-    )
+    # 2. 申请锁并放入后台线程执行
+    async with gpu_semaphore:
+        logger.info("获取到处理令牌，开始执行说话人分离 (后台线程)...")
+        updated = await asyncio.to_thread(
+            perform_pyannote_diarization,
+            req.audio_path,
+            transcript_dicts,
+            hf_token
+        )
+        logger.info("🔓 处理完成，释放锁。下一个任务可以开始了。")
 
     # 3. 封装返回
     resp_items: List[TranscriptItem] = [

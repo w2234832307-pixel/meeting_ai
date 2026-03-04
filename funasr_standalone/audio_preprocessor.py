@@ -69,7 +69,7 @@ class AudioPreprocessor:
                 output_path
             ]
             
-            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
             logger.info(f"✅ 音频预处理完成: {output_path}")
             return output_path
             

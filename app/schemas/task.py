@@ -2,12 +2,23 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
 # 逐字稿单项数据模型
+from typing import Optional, Union
+
 class TranscriptItem(BaseModel):
-    """逐字稿单项"""
     text: str = Field(..., description="文本内容")
     start_time: float = Field(..., description="开始时间（秒）")
     end_time: float = Field(..., description="结束时间（秒）")
-    speaker_id: Optional[int] = Field(None, description="说话人ID（如果启用说话人分离）")
+    speaker_id: Optional[Union[str, int]] = Field(None, description="说话人名称或ID")
+    audio_name: Optional[str] = Field(None, description="来源音频文件名或URL标识")
+
+# 说话人摘要数据模型
+class SpeakerSummary(BaseModel):
+    """说话人摘要"""
+    speaker_id: str = Field(..., description="说话人ID")
+    speaker_name: Optional[str] = Field(None, description="说话人姓名（如果声纹匹配成功）")
+    summary: str = Field(..., description="该说话人的发言摘要")
+    word_count: int = Field(0, description="该说话人的总字数")
+    speech_segments: int = Field(0, description="该说话人的发言段数")
 
 # 这是返给 Java 的最终结果格式
 class MeetingResponse(BaseModel):
@@ -32,6 +43,9 @@ class MeetingResponse(BaseModel):
     
     # 消耗的 Token (方便你统计成本)
     usage_tokens: int = Field(0, description="LLM 消耗的 token 数")
+    
+    # 说话人摘要（新增）
+    speaker_summaries: Optional[Dict[str, SpeakerSummary]] = Field(None, description="各说话人的发言摘要")
 
 class ArchiveRequest(BaseModel):
     minutes_id: int = Field(..., description="MySQL里的会议纪要ID (minutes_draft_id)")

@@ -51,6 +51,20 @@ _fix_datasets_compatibility()
 
 import os
 import sys
+import numpy as np
+
+if not hasattr(np, 'float_'):
+    np.float_ = np.float64
+if not hasattr(np, 'int_'):
+    np.int_ = np.int64
+if not hasattr(np, 'bool_'):
+    np.bool_ = bool
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(current_dir)
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
+
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -62,6 +76,19 @@ import gc
 import torch
 from hotword_service import get_hotword_service  # ✅ 导入热词服务
 from audio_preprocessor import audio_preprocessor  # ✅ 导入音频预处理
+import subprocess
+import tempfile as tmp
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+import soundfile as sf
+
+import requests  
+from urllib.parse import urlparse 
+import uuid
+from pyannote_diarization import perform_pyannote_diarization
+from app.services.voice_service import get_voice_service
+
 # 声纹匹配延迟加载，避免启动时的依赖错误
 # from voice_matcher import get_voice_matcher
 
@@ -135,14 +162,14 @@ try:
     )
     logger.info("✅ VAD 模型加载成功")
     
-    # 3. 说话人识别模型（用于声纹提取和聚类）
-    logger.info("📦 加载 Cam++ 说话人模型（说话人分离）...")
-    speaker_model = AutoModel(
-        model="iic/speech_campplus_sv_zh-cn_16k-common",
-        device=DEVICE,
-        disable_update=True
-    )
-    logger.info("✅ Cam++ 说话人模型加载成功")
+    # # 3. 说话人识别模型（用于声纹提取和聚类）
+    # logger.info("📦 加载 Cam++ 说话人模型（说话人分离）...")
+    # speaker_model = AutoModel(
+    #     model="iic/speech_campplus_sv_zh-cn_16k-common",
+    #     device=DEVICE,
+    #     disable_update=True
+    # )
+    # logger.info("✅ Cam++ 说话人模型加载成功")
     
     # =================== 旧模型配置（已注释，可回退）===================
     # # Paraformer-zh（标准模型）
@@ -173,6 +200,45 @@ try:
 except Exception as e:
     logger.critical(f"❌ 模型加载失败: {e}", exc_info=True)
     sys.exit(1)
+
+# =============================================
+# 辅助函数：安全下载
+# =============================================
+def download_audio_from_url(url: str, timeout: int = 300) -> str:
+    """
+    下载音频到本地临时文件，返回文件路径。
+    如果失败抛出异常，由调用方捕获。
+    """
+    try:
+        # 1. 解析后缀
+        parsed_url = urlparse(url)
+        ext = os.path.splitext(parsed_url.path)[1]
+        if not ext:
+            ext = ".mp3" # 默认后缀
+            
+        # 2. 创建临时文件占位
+        # 使用 delete=False 确保文件关闭后不会立即被删，由后续逻辑手动删
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        temp_file_path = temp_file.name
+        temp_file.close() # 立即关闭句柄，让 requests去写
+
+        logger.info(f"⬇️ 正在下载: {url} -> {temp_file_path}")
+        
+        # 3. 流式下载
+        with requests.get(url, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            with open(temp_file_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    
+        logger.info(f"✅ 下载完成: {os.path.getsize(temp_file_path) / 1024 / 1024:.2f} MB")
+        return temp_file_path
+
+    except Exception as e:
+        # 如果生成了临时文件但下载失败，尝试清理
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise e
 
 # =============================================
 # 3. FastAPI 服务
@@ -206,40 +272,38 @@ async def transcribe_word_level(
     """
     from word_level_asr import extract_word_level_timestamps
     
-    temp_file_path = None
+    # 初始化变量，防止 finally 报错
+    temp_file_path = None # 用于文件上传
+    url_downloaded_file = None # 用于URL下载
     input_data = None
     
     try:
-        # === 处理输入：支持文件上传、本地路径、URL ===
+        # === 1. 处理输入 ===
         if file:
             logger.info(f"📥 接收到文件上传: {file.filename}")
             suffix = Path(file.filename).suffix if file.filename else ".mp3"
-            # 存临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                shutil.copyfileobj(file.file, tmp)
-                temp_file_path = Path(tmp.name)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as t_file:
+                shutil.copyfileobj(file.file, t_file)
+                temp_file_path = Path(t_file.name)
             input_data = str(temp_file_path)
             
         elif audio_path:
             logger.info(f"📂 接收到本地文件路径: {audio_path}")
             if not os.path.exists(audio_path):
-                return {
-                    "code": 1,
-                    "msg": f"音频文件不存在: {audio_path}",
-                    "words": []
-                }
+                return {"code": 1, "msg": f"文件不存在: {audio_path}", "words": []}
             input_data = audio_path.strip()
             
         elif audio_url:
             logger.info(f"🔗 接收到音频 URL: {audio_url}")
-            input_data = audio_url.strip()
-            
+            # ✅ 修复核心：调用辅助函数下载
+            try:
+                url_downloaded_file = download_audio_from_url(audio_url)
+                input_data = url_downloaded_file # 将处理目标指向下载好的本地文件
+            except Exception as e:
+                return {"code": 1, "msg": f"URL下载失败: {str(e)}", "words": []}
+                
         else:
-            return {
-                "code": 1,
-                "msg": "必须提供 file、audio_path 或 audio_url 之一",
-                "words": []
-            }
+            return {"code": 1, "msg": "参数错误", "words": []}
         
         # === 音频预处理（可选，提升准确率3-5%）===
         if isinstance(input_data, str) and Path(input_data).exists():
@@ -333,18 +397,41 @@ async def transcribe_word_level(
             logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个）")
         
         # 步骤2: 批量识别并提取字级别时间戳
-        audio_file_path = str(temp_file_path) if temp_file_path else input_data
+        audio_file_path = input_data
+        
+        # 优化：如果输入是 URL，先下载到本地临时文件（避免 ffmpeg 从 URL 提取片段失败）
+        url_downloaded_file = None
+        if isinstance(audio_file_path, str) and audio_file_path.startswith(("http://", "https://")):
+            logger.info(f"🔗 检测到 URL 输入，先下载到本地临时文件...")
+            try:
+                import requests
+                response = requests.get(audio_file_path, stream=True, timeout=300)
+                response.raise_for_status()
+                
+                # 根据 Content-Type 或 URL 后缀确定文件扩展名
+                content_type = response.headers.get("Content-Type", "")
+                if "audio/mpeg" in content_type or "audio/mp3" in content_type:
+                    suffix = ".mp3"
+                elif "audio/mp4" in content_type or "audio/m4a" in content_type:
+                    suffix = ".m4a"
+                elif "audio/wav" in content_type:
+                    suffix = ".wav"
+                else:
+                    # 从 URL 推断
+                    suffix = Path(audio_file_path).suffix or ".mp3"
+                
+                url_downloaded_file = tmp.NamedTemporaryFile(delete=False, suffix=suffix)
+                for chunk in response.iter_content(chunk_size=8192):
+                    url_downloaded_file.write(chunk)
+                url_downloaded_file.close()
+                audio_file_path = url_downloaded_file.name
+                logger.info(f"✅ URL 下载完成: {audio_file_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ URL 下载失败: {e}，将尝试直接从 URL 提取（可能失败）")
         
         # 配置：10GB显存优化
         BATCH_SIZE = 8  # 每批处理8个片段
         MAX_CONCURRENT = 4  # 增加到4个并发线程（提升片段提取速度）
-        
-        import subprocess
-        import tempfile as tmp
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import io
-        import soundfile as sf
-        import numpy as np
         
         # 批量提取片段到内存
         logger.info(f"📦 批量提取 {len(vad_segments)} 个音频片段到内存...")
@@ -352,23 +439,31 @@ async def transcribe_word_level(
         segment_metadata = {}
         
         def extract_segment_to_memory(idx, segment):
-            """提取单个片段到内存"""
-            if not isinstance(segment, list) or len(segment) < 2:
-                return None, None
-            
+            """提取单个片段到内存 (SoundFile 高速版)"""
             start_ms, end_ms = segment[0], segment[1]
             
             try:
-                cmd = ["ffmpeg", "-i", audio_file_path, "-ss", str(start_ms / 1000.0)]
-                if end_ms != -1:
-                    duration = (end_ms - start_ms) / 1000.0
-                    cmd.extend(["-t", str(duration)])
-                cmd.extend(["-ac", "1", "-ar", "16000", "-f", "wav", "-"])
-                
-                result = subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-                audio_io = io.BytesIO(result.stdout)
-                audio_data, sample_rate = sf.read(audio_io)
-                return (audio_data, sample_rate), (start_ms, end_ms)
+                # 使用 SoundFile 直接读取，替代 ffmpeg 子进程
+                with sf.SoundFile(audio_file_path) as f:
+                    sr = f.samplerate
+                    # 计算帧位置
+                    start_frame = int(start_ms / 1000 * sr)
+                    
+                    if end_ms == -1:
+                        frames_to_read = -1 # 读取到末尾
+                    else:
+                        frames_to_read = int((end_ms - start_ms) / 1000 * sr)
+                    
+                    # Seek 并读取
+                    f.seek(start_frame)
+                    audio_data = f.read(frames_to_read)
+                    
+                    # 简单兼容性处理：如果是立体声转单声道
+                    if len(audio_data.shape) > 1:
+                        audio_data = audio_data.mean(axis=1)
+                        
+                    return (audio_data, sr), (start_ms, end_ms)
+
             except Exception as e:
                 logger.warning(f"⚠️ 提取片段 {idx} 失败: {e}")
                 return None, None
@@ -505,6 +600,14 @@ async def transcribe_word_level(
                 logger.debug(f"🧹 已清理临时文件: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"⚠️ 清理临时文件失败: {e}")
+        
+        # 清理 URL 下载的临时文件
+        if 'url_downloaded_file' in locals() and url_downloaded_file and os.path.exists(url_downloaded_file):
+            try:
+                os.remove(url_downloaded_file)
+                logger.debug(f"🧹 已清理 URL 下载的临时文件: {url_downloaded_file}")
+            except Exception as e:
+                logger.warning(f"⚠️ 清理 URL 下载的临时文件失败: {e}")
 
 
 @router.post("/transcribe")
@@ -512,27 +615,65 @@ async def transcribe(
     # 1. file 改为可选
     file: UploadFile = File(None), 
     # 2. url 参数
-    audio_url: str = Form(None),   
+    audio_url: str = Form(None),    
     hotword: str = Form(""),  # 外部传入的热词（可选）
-    enable_speaker_diarization: bool = Form(True)  # 是否启用说话人分离（默认启用，主服务用Pyannote时可设为False）
+    enable_speaker_diarization: bool = Form(True)  # 是否启用说话人分离
 ):
-    temp_file_path = None
-    input_data = None 
+    # --- 第1层缩进 (4个空格) ---
+    temp_file_path = None # 上传的
+    url_downloaded_file = None # URL下载的
+    input_data = None
+
+    # 定义内部函数：必须与外层逻辑保持同级缩进
+    def extract_segment_to_memory(idx, segment):
+        """提取单个片段到内存 (SoundFile 高速版)"""
+        # --- 第2层缩进 (8个空格) ---
+        if not isinstance(segment, list) or len(segment) < 2:
+            return None, None
+        
+        start_ms, end_ms = segment[0], segment[1]
+        
+        try:
+            # 使用 SoundFile 直接读取，替代 ffmpeg 子进程
+            with sf.SoundFile(audio_file_path) as f:
+                sr = f.samplerate
+                # 计算帧位置
+                start_frame = int(start_ms / 1000 * sr)
+                
+                if end_ms == -1:
+                    frames_to_read = -1 # 读取到末尾
+                else:
+                    frames_to_read = int((end_ms - start_ms) / 1000 * sr)
+                
+                # Seek 并读取
+                f.seek(start_frame)
+                audio_data = f.read(frames_to_read)
+                
+                # 简单兼容性处理：如果是立体声转单声道
+                if len(audio_data.shape) > 1:
+                    audio_data = audio_data.mean(axis=1)
+                    
+                return (audio_data, sr), (start_ms, end_ms)
+
+        except Exception as e:
+            logger.warning(f"⚠️ 提取片段 {idx} 失败: {e}")
+            return None, None
 
     try:
         # === 逻辑判断 ===
         if file:
             logger.info(f"📥 接收到文件上传: {file.filename}")
             suffix = Path(file.filename).suffix
-            # 存临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                shutil.copyfileobj(file.file, tmp)
-                temp_file_path = Path(tmp.name)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as t_file:
+                shutil.copyfileobj(file.file, t_file)
+                temp_file_path = Path(t_file.name)
             input_data = str(temp_file_path)
 
         elif audio_url:
             logger.info(f"🔗 接收到音频 URL: {audio_url}")
-            input_data = audio_url.strip() # 去除空格
+            # ✅ 修复核心：这里必须下载！否则 VAD 会卡死！
+            url_downloaded_file = download_audio_from_url(audio_url)
+            input_data = url_downloaded_file 
             
         else:
             raise HTTPException(status_code=400, detail="必须提供 file 或 audio_url")
@@ -594,15 +735,12 @@ async def transcribe(
             
             # 动态调整：根据片段数量调整合并策略
             if len(vad_segments) > 200:
-                # 片段非常多，更激进的合并
                 MIN_SEGMENT_DURATION_MS = 8000  # 最小片段时长8秒
                 MAX_GAP_MS = 3000  # 最大间隔3秒
             elif len(vad_segments) > 100:
-                # 片段较多，中等合并
                 MIN_SEGMENT_DURATION_MS = 6000  # 最小片段时长6秒
                 MAX_GAP_MS = 2500  # 最大间隔2.5秒
             else:
-                # 片段较少，标准合并
                 MIN_SEGMENT_DURATION_MS = 5000  # 最小片段时长5秒
                 MAX_GAP_MS = 2000  # 最大间隔2秒
             
@@ -669,86 +807,34 @@ async def transcribe(
                         else:
                             current_segment = segment
             
-            # 处理最后一个暂存的片段（不丢弃，强制合并或添加）
+            # 处理最后一个暂存的片段
             if current_segment:
                 merged_duration = current_segment[1] - current_segment[0] if current_segment[1] != -1 else 999999
-                # 即使不够最小长度，也添加（避免丢内容）
-                if merged_duration >= 1.0:  # 至少1秒就保留
+                if merged_duration >= 1.0:
                     merged_segments.append(current_segment)
                 elif len(merged_segments) > 0:
-                    # 如果太短，合并到最后一个片段（避免丢内容）
-                    last_segment = merged_segments[-1]
-                    if last_segment[1] != -1 and current_segment[1] != -1:
-                        last_segment[1] = current_segment[1]
-                    logger.debug(f"🔧 将短片段合并到前一个片段，避免丢内容")
+                    merged_segments[-1][1] = current_segment[1]
             
             original_count = len(vad_segments)
             vad_segments = merged_segments
-            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段（减少 {original_count - len(merged_segments)} 个，避免丢内容）")
+            logger.info(f"✅ 合并完成: {original_count} → {len(merged_segments)} 个片段")
         
         # ===== 步骤2：批量提取片段并识别（优化：批量处理 + 内存缓存）=====
         logger.info("🎤 步骤2: SenseVoiceSmall 批量识别（优化版）...")
         
-        # 使用临时文件路径（如果有）
-        audio_file_path = str(temp_file_path) if temp_file_path else input_data
+        # 这里的 audio_file_path 必须确保是本地路径（前面逻辑已保证）
+        audio_file_path = input_data
         
         # 配置：10GB显存优化
-        BATCH_SIZE = 8  # 每批处理8个片段（10GB显存）
-        MAX_CONCURRENT = 2  # 最多2个并发线程
+        BATCH_SIZE = 8  
+        MAX_CONCURRENT = 4 
         
-        import subprocess
-        import tempfile as tmp
-        import re
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import io
-        import soundfile as sf
-        import numpy as np
-        
-        # 优化1&4: 批量提取片段到内存，避免频繁磁盘I/O
+        # 批量提取片段到内存
         logger.info(f"📦 批量提取 {len(vad_segments)} 个音频片段到内存...")
         segment_audio_data = {}  # {segment_idx: (audio_data, sample_rate)}
         segment_metadata = {}  # {segment_idx: (start_ms, end_ms)}
         
-        def extract_segment_to_memory(idx, segment):
-            """提取单个片段到内存"""
-            if not isinstance(segment, list) or len(segment) < 2:
-                return None, None
-            
-            start_ms, end_ms = segment[0], segment[1]
-            
-            try:
-                # 使用 ffmpeg 提取到内存（通过管道）
-                cmd = ["ffmpeg", "-i", audio_file_path, "-ss", str(start_ms / 1000.0)]
-                
-                if end_ms != -1:
-                    duration = (end_ms - start_ms) / 1000.0
-                    cmd.extend(["-t", str(duration)])
-                
-                cmd.extend([
-                    "-ac", "1", "-ar", "16000",
-                    "-f", "wav",
-                    "-"  # 输出到stdout
-                ])
-                
-                # 提取音频数据到内存
-                result = subprocess.run(
-                    cmd, 
-                    check=True, 
-                    capture_output=True, 
-                    timeout=30
-                )
-                
-                # 从内存中读取音频数据
-                audio_io = io.BytesIO(result.stdout)
-                audio_data, sample_rate = sf.read(audio_io)
-                
-                return (audio_data, sample_rate), (start_ms, end_ms)
-                
-            except Exception as e:
-                logger.warning(f"⚠️ 提取片段 {idx} 失败: {e}")
-                return None, None
-        
-        # 优化3: 并行提取片段（控制并发数）
+        # 并行提取片段 (使用上面定义的内部函数)
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
             futures = {
                 executor.submit(extract_segment_to_memory, idx, segment): idx 
@@ -767,19 +853,18 @@ async def transcribe(
         
         logger.info(f"✅ 成功提取 {len(segment_audio_data)} 个片段到内存")
         
-        # 优化2: 批量识别（分批处理，避免显存溢出）
+        # 批量识别并提取字级别时间戳
+        all_words = []
+        sorted_indices = sorted(segment_audio_data.keys())
         segment_results = []
         full_text_parts = []
-        
-        # 按segment_idx排序，确保顺序
-        sorted_indices = sorted(segment_audio_data.keys())
         
         # 分批处理
         for batch_start in range(0, len(sorted_indices), BATCH_SIZE):
             batch_indices = sorted_indices[batch_start:batch_start + BATCH_SIZE]
             logger.info(f"🔄 批量识别片段 {batch_start+1}-{min(batch_start+BATCH_SIZE, len(sorted_indices))}/{len(sorted_indices)}")
             
-            # 将内存中的音频数据写入临时文件（批量识别需要文件路径）
+            # 将内存中的音频数据写入临时文件
             batch_files = []
             batch_metadata = []
             
@@ -787,7 +872,6 @@ async def transcribe(
                 audio_data, sample_rate = segment_audio_data[idx]
                 start_ms, end_ms = segment_metadata[idx]
                 
-                # 写入临时文件（批量识别需要）
                 temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
                 temp_segment.close()
                 temp_segment_path = temp_segment.name
@@ -809,47 +893,24 @@ async def transcribe(
                     if i < len(batch_results) and batch_results[i]:
                         result_item = batch_results[i]
                         text = result_item.get("text", "").strip()
-                        
                         # 清理 SenseVoice 的语言标签
                         text = re.sub(r'<\|[^|]+\|>', '', text).strip()
                         
-                        # 过滤非中文内容
-                        if text:
-                            # 检查是否包含日文假名
-                            if re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
-                                logger.debug(f"⏭️ 过滤日文内容: {text[:20]}...")
-                                continue
-                            # 检查是否包含韩文
-                            if re.search(r'[\uAC00-\uD7AF]', text):
-                                logger.debug(f"⏭️ 过滤韩文内容: {text[:20]}...")
-                                continue
-                            # 检查是否主要是英文单词
-                            english_chars = len(re.findall(r'[a-zA-Z]', text))
-                            if len(text) > 0 and english_chars / len(text) > 0.5:
-                                logger.debug(f"⏭️ 过滤英文内容: {text[:20]}...")
-                                continue
-                        
-                        if not text:
+                        if not text or len(text) < 2:
                             continue
-                        
-                        # 优化：按句子切分，而不是按VAD段
+                            
                         # 检查是否有timestamp信息（句子级别）
-                        timestamp = result_item.get("timestamp", [])
                         sentences = result_item.get("sentences", [])
                         
                         if sentences and len(sentences) > 0:
-                            # 使用句子级别的信息
                             for sent in sentences:
                                 sent_text = sent.get("text", "").strip()
-                                if not sent_text or len(sent_text) < 2:  # 过滤太短的句子
-                                    continue
-                                
+                                if not sent_text: continue
                                 sent_timestamp = sent.get("timestamp", [])
                                 if sent_timestamp and len(sent_timestamp) >= 2:
                                     sent_start = sent_timestamp[0] / 1000.0 if isinstance(sent_timestamp[0], (int, float)) else start_ms / 1000.0
                                     sent_end = sent_timestamp[1] / 1000.0 if isinstance(sent_timestamp[1], (int, float)) else end_ms / 1000.0
                                 else:
-                                    # 如果没有时间戳，使用VAD段的时间，但按句子比例分配
                                     sent_start = start_ms / 1000.0
                                     sent_end = end_ms / 1000.0 if end_ms != -1 else 999999
                                 
@@ -858,76 +919,21 @@ async def transcribe(
                                     "end_time": round(sent_end, 2),
                                     "text": sent_text,
                                     "segment_idx": idx,
-                                    "_audio_data": segment_audio_data[idx]  # 缓存音频数据供步骤3使用
+                                    "_audio_data": segment_audio_data[idx]
                                 })
                                 full_text_parts.append(sent_text)
-                        elif timestamp and len(timestamp) > 0:
-                            # 使用timestamp信息按句子切分
-                            # timestamp格式可能是 [[start, end, word], ...] 或 [[start, end], ...]
-                            current_sentence = []
-                            current_start = None
-                            current_end = None
-                            
-                            for ts_item in timestamp:
-                                if not isinstance(ts_item, list) or len(ts_item) < 2:
-                                    continue
-                                
-                                ts_start = ts_item[0] / 1000.0 if isinstance(ts_item[0], (int, float)) else start_ms / 1000.0
-                                ts_end = ts_item[1] / 1000.0 if isinstance(ts_item[1], (int, float)) else end_ms / 1000.0
-                                word = ts_item[-1] if len(ts_item) > 2 else ""
-                                
-                                if current_start is None:
-                                    current_start = ts_start
-                                
-                                current_sentence.append(word)
-                                current_end = ts_end
-                                
-                                # 遇到标点符号或停顿超过0.5秒，分句
-                                if word in ["。", "？", "！", ".", "?", "!"] or (len(current_sentence) > 1 and ts_start - current_end > 0.5):
-                                    sent_text = "".join(current_sentence).strip()
-                                    if sent_text and len(sent_text) >= 2:  # 过滤太短的句子
-                                        segment_results.append({
-                                            "start_time": round(current_start, 2),
-                                            "end_time": round(current_end, 2),
-                                            "text": sent_text,
-                                            "segment_idx": idx,
-                                            "_audio_data": segment_audio_data[idx]
-                                        })
-                                        full_text_parts.append(sent_text)
-                                    current_sentence = []
-                                    current_start = None
-                            
-                            # 处理最后一句
-                            if current_sentence:
-                                sent_text = "".join(current_sentence).strip()
-                                if sent_text and len(sent_text) >= 2:
-                                    segment_results.append({
-                                        "start_time": round(current_start, 2),
-                                        "end_time": round(current_end, 2),
-                                        "text": sent_text,
-                                        "segment_idx": idx,
-                                        "_audio_data": segment_audio_data[idx]
-                                    })
-                                    full_text_parts.append(sent_text)
                         else:
-                            # 没有句子级别信息，按标点符号切分文本
-                            # 过滤太短的文本（少于3个字）
-                            if len(text) < 3:
-                                continue
-                            
-                            # 按标点符号切分
-                            sentences = re.split(r'([。！？\n])', text)
+                            # 降级：按标点切分
+                            sentences_split = re.split(r'([。！？\n])', text)
                             current_sent = ""
                             sent_start = start_ms / 1000.0
                             segment_duration = (end_ms - start_ms) / 1000.0 if end_ms != -1 else 1.0
                             char_duration = segment_duration / max(len(text), 1)
                             
-                            for part in sentences:
-                                if not part.strip():
-                                    continue
-                                
+                            for part in sentences_split:
+                                if not part.strip(): continue
                                 if part in ["。", "！", "？", "\n"]:
-                                    if current_sent.strip() and len(current_sent.strip()) >= 2:
+                                    if current_sent.strip():
                                         sent_end = sent_start + len(current_sent) * char_duration
                                         segment_results.append({
                                             "start_time": round(sent_start, 2),
@@ -937,481 +943,118 @@ async def transcribe(
                                             "_audio_data": segment_audio_data[idx]
                                         })
                                         full_text_parts.append(current_sent.strip())
-                                    sent_start = sent_end
-                                    current_sent = ""
+                                        sent_start = sent_end
+                                        current_sent = ""
                                 else:
                                     current_sent += part
-                            
-                            # 处理最后一句
-                            if current_sent.strip() and len(current_sent.strip()) >= 2:
-                                sent_end = sent_start + len(current_sent) * char_duration
+                            if current_sent.strip():
                                 segment_results.append({
                                     "start_time": round(sent_start, 2),
-                                    "end_time": round(sent_end, 2),
+                                    "end_time": round(sent_start + len(current_sent) * char_duration, 2),
                                     "text": current_sent.strip(),
                                     "segment_idx": idx,
                                     "_audio_data": segment_audio_data[idx]
                                 })
                                 full_text_parts.append(current_sent.strip())
-                
+
             except Exception as e:
-                logger.warning(f"⚠️ 批量识别失败: {e}，降级为单段识别")
-                # 降级：单段识别
-                for idx, (start_ms, end_ms) in batch_metadata:
-                    audio_data, sample_rate = segment_audio_data[idx]
-                    temp_segment = tmp.NamedTemporaryFile(delete=False, suffix=".wav")
-                    temp_segment.close()
-                    temp_segment_path = temp_segment.name
-                    sf.write(temp_segment_path, audio_data, sample_rate)
-                    
-                    try:
-                        seg_res = asr_model.generate(
-                            input=temp_segment_path,
-                            language="zh",
-                            use_itn=True
-                        )
-                        
-                        if seg_res and len(seg_res) > 0:
-                            text = seg_res[0].get("text", "").strip()
-                            text = re.sub(r'<\|[^|]+\|>', '', text).strip()
-                            
-                        # 降级处理：按标点符号切分
-                        if len(text) < 3:
-                            continue
-                        
-                        # 按标点符号切分
-                        sentences = re.split(r'([。！？\n])', text)
-                        current_sent = ""
-                        sent_start = start_ms / 1000.0
-                        segment_duration = (end_ms - start_ms) / 1000.0 if end_ms != -1 else 1.0
-                        char_duration = segment_duration / max(len(text), 1)
-                        
-                        for part in sentences:
-                            if not part.strip():
-                                continue
-                            
-                            if part in ["。", "！", "？", "\n"]:
-                                if current_sent.strip() and len(current_sent.strip()) >= 2:
-                                    sent_end = sent_start + len(current_sent) * char_duration
-                                    segment_results.append({
-                                        "start_time": round(sent_start, 2),
-                                        "end_time": round(sent_end, 2),
-                                        "text": current_sent.strip(),
-                                        "segment_idx": idx,
-                                        "_audio_data": segment_audio_data[idx]
-                                    })
-                                    full_text_parts.append(current_sent.strip())
-                                sent_start = sent_end
-                                current_sent = ""
-                            else:
-                                current_sent += part
-                        
-                        # 处理最后一句
-                        if current_sent.strip() and len(current_sent.strip()) >= 2:
-                            sent_end = sent_start + len(current_sent) * char_duration
-                            segment_results.append({
-                                "start_time": round(sent_start, 2),
-                                "end_time": round(sent_end, 2),
-                                "text": current_sent.strip(),
-                                "segment_idx": idx,
-                                "_audio_data": segment_audio_data[idx]
-                            })
-                            full_text_parts.append(current_sent.strip())
-                    except Exception as e2:
-                        logger.warning(f"⚠️ 识别片段 {idx} 失败: {e2}")
-                    finally:
-                        try:
-                            os.remove(temp_segment_path)
-                        except:
-                            pass
-            
+                logger.warning(f"⚠️ 批量识别失败: {e}")
             finally:
-                # 清理批量临时文件
                 for temp_file in batch_files:
-                    try:
-                        os.remove(temp_file)
-                    except:
-                        pass
+                    try: os.remove(temp_file)
+                    except: pass
         
         full_text = "".join(full_text_parts)
-        logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段，文本长度: {len(full_text)} 字")
+        logger.info(f"✅ ASR 识别完成，共 {len(segment_results)} 个片段")
         
-        # ===== 步骤3：说话人分离（支持Pyannote和Cam++两种方案）=====
-        # 如果主服务禁用说话人分离（将使用外部Pyannote服务），则跳过
+        # ===== 步骤3：说话人分离与熟人识别 (黄金组合) =====
         if not enable_speaker_diarization:
-            logger.info("ℹ️ 说话人分离已禁用（将由主服务使用Pyannote处理）")
-            # 为所有片段设置默认 speaker_id
+            logger.info("ℹ️ 说话人分离已禁用")
             for result in segment_results:
                 result['speaker_id'] = '0'
-            speaker_info = []
-            # 跳过后续的编号规范化和说话人统计逻辑
-            skip_speaker_normalization = True
         else:
-            # 检查是否使用Pyannote（通过环境变量或配置）
-            use_pyannote = os.getenv("USE_PYANNOTE", "false").lower() == "true"
-            
-            if use_pyannote:
-                logger.info("🎤 步骤3: 使用 Pyannote.audio 进行说话人分离（专业模型）...")
-                try:
-                    from pyannote_diarization import perform_pyannote_diarization
-                    
-                    # 准备transcript格式的数据
-                    transcript_for_pyannote = [
-                        {
-                            "text": result.get("text", ""),
-                            "start_time": result.get("start_time", 0),
-                            "end_time": result.get("end_time", 0)
-                        }
-                        for result in segment_results
-                    ]
-                    
-                    # 使用Pyannote进行说话人分离
-                    transcript_with_speakers = perform_pyannote_diarization(
-                        audio_path=audio_file_path,
-                        transcript=transcript_for_pyannote
-                    )
-                    
-                    # 将说话人信息合并到segment_results
-                    for i, result in enumerate(segment_results):
-                        if i < len(transcript_with_speakers):
-                            result['speaker_id'] = transcript_with_speakers[i].get('speaker_id', '0')
-                        else:
-                            result['speaker_id'] = '0'
-                    
-                    logger.info("✅ Pyannote 说话人分离完成")
-                    speaker_info = []  # Pyannote不需要speaker_info
-                    
-                except ImportError:
-                    logger.warning("⚠️ Pyannote 未安装，降级使用 Cam++ 方案")
-                    logger.warning("   安装命令: pip install pyannote.audio")
-                    use_pyannote = False
-                except Exception as e:
-                    logger.error(f"❌ Pyannote 说话人分离失败: {e}，降级使用 Cam++ 方案")
-                    use_pyannote = False
-            
-            if not use_pyannote:
-                logger.info("🎤 步骤3: 使用 Cam++ 进行说话人分离（优化：复用缓存音频）...")
+            try:
+                # 3.1 使用 Pyannote 进行高精度时间切分和单场聚合
+                logger.info("🎤 步骤3.1: 调用 Pyannote 进行精准说话人分离...")
                 
-                # 优化2: 复用步骤2提取的音频数据，避免重复提取
-                from speaker_diarization import perform_speaker_diarization_with_cached_audio
-                
-                # 构建缓存的音频数据映射
-                cached_audio_map = {
-                    result['segment_idx']: result.get('_audio_data')
-                    for result in segment_results
-                    if '_audio_data' in result
-                }
-                
-                # 调用优化后的说话人分离函数（使用缓存的音频数据）
-                speaker_info = perform_speaker_diarization_with_cached_audio(
-                    vad_segments=vad_segments,
-                    cached_audio_map=cached_audio_map,
-                    speaker_model=speaker_model,
-                    device=DEVICE,
-                    min_segment_duration=2.0,  # 提高最小片段时长到2秒
-                    distance_threshold=0.2,  # 进一步降低阈值到0.2
-                    audio_file_path=audio_file_path  # 降级时使用原始文件
+                # segment_results 里已经有了 start_time, end_time 和 text，正是 Pyannote 需要的格式
+                # audio_file_path 是已经下载好并经 ffmpeg 处理过的本地 WAV 文件，速度极快
+                diarized_transcript = perform_pyannote_diarization(
+                    audio_path=audio_file_path,
+                    transcript=segment_results
                 )
-            
-            # 将说话人信息合并到识别结果
-            if not use_pyannote:
-                # Cam++ 方案：需要映射speaker_info到segment_results
-                # speaker_info 中的 speaker_id 已经是重新映射后的连续编号（0, 1, 2, 3...）
-                speaker_dict = {s['segment_idx']: s['speaker_id'] for s in speaker_info if 'segment_idx' in s}
                 
-                # 统计哪些 segment_idx 有声纹信息
-                valid_segment_indices = set(speaker_dict.keys())
-                logger.debug(f"🔍 有效声纹片段索引: {sorted(valid_segment_indices)}")
-                
-                # 为所有片段分配说话人ID（如果某个片段没有声纹，使用最近的有声纹片段的说话人）
-                for idx, result in enumerate(segment_results):
-                    seg_idx = result.get('segment_idx', -1)
-                    
-                    if seg_idx in speaker_dict:
-                        # 有声纹信息，直接使用（已经是连续编号 0, 1, 2, 3...）
-                        result['speaker_id'] = speaker_dict[seg_idx]
+                # 3.2 使用 Cam++ 进行跨场次声纹库对比 (认人)
+                logger.info("🎤 步骤3.2: 调用 Cam++ 进行声纹库检索匹配...")
+                try:
+                    voice_svc = get_voice_service()
+                    if voice_svc and voice_svc.enabled:
+                        # 截取每个 SPEAKER_XX 的 10 秒纯净录音片段
+                        speaker_audio_files = voice_svc.extract_speaker_segments(
+                            audio_path=audio_file_path,
+                            transcript=diarized_transcript,
+                            duration=10
+                        )
+                        
+                        # 去 ChromaDB 里搜索比对，相似度大于 0.75 判定为熟人
+                        matched_results = voice_svc.match_speakers(
+                            speaker_segments=speaker_audio_files, 
+                            threshold=0.75
+                        )
+                        
+                        # 如果匹配成功，将 SPEAKER_00 替换为 "张三"
+                        segment_results = voice_svc.replace_speaker_ids(
+                            transcript=diarized_transcript, 
+                            matched=matched_results
+                        )
+                        logger.info("✅ 声纹熟人识别全流程完成")
                     else:
-                        # 没有声纹信息，找到最近的有声纹片段
-                        found_speaker = None
-                        min_distance = float('inf')
-                        
-                        # 查找最近的有效片段
-                        for valid_idx in valid_segment_indices:
-                            distance = abs(valid_idx - seg_idx)
-                            if distance < min_distance:
-                                min_distance = distance
-                                found_speaker = speaker_dict[valid_idx]
-                        
-                        # 如果找到了，使用该说话人ID；否则使用默认值"0"
-                        result['speaker_id'] = found_speaker if found_speaker is not None else "0"
-            else:
-                # Pyannote 方案：已经直接更新了segment_results，不需要额外处理
-                logger.debug("✅ Pyannote 已直接更新说话人信息，跳过映射步骤")
-        
-        # 强制重新映射说话人ID，确保从0开始连续编号
-        # 注意：这只是编号规范化，不影响识别结果！
-        # 哪些片段属于哪个说话人是由声纹聚类算法决定的，不是写死的
-        # 如果说话人分离已禁用（由主服务使用Pyannote处理），则跳过此步骤
-        
-        if not enable_speaker_diarization:
-            # 说话人分离已禁用，跳过编号规范化
-            logger.debug("ℹ️ 说话人分离已禁用，跳过编号规范化（将由主服务处理）")
-        else:
-            all_speaker_ids = set(r['speaker_id'] for r in segment_results)
-            
-            # 找出每个说话人ID第一次出现的时间
-            first_occurrence = {}
-            for result in segment_results:
-                speaker_id = result['speaker_id']
-                start_time = result.get('start_time', 0)
-                if speaker_id not in first_occurrence or start_time < first_occurrence[speaker_id]:
-                    first_occurrence[speaker_id] = start_time
-            
-            # 按第一次出现的时间排序（第一个出现的说话人 -> 0，第二个 -> 1...）
-            unique_speakers = sorted(all_speaker_ids, key=lambda x: first_occurrence[x])
-            n_speakers = len(unique_speakers)
-            
-            # 重新映射：第一个出现的说话人 -> 0，第二个 -> 1...
-            # 这只是编号规范化，不影响哪些片段属于哪个说话人
-            
-            speaker_remap = {old_id: str(new_id) for new_id, old_id in enumerate(unique_speakers)}
-            logger.debug(f"🔍 映射关系: {speaker_remap}")
-            
-            for result in segment_results:
-                old_id = result['speaker_id']
-                result['speaker_id'] = speaker_remap[old_id]
-            
-            # 验证映射结果
-            final_ids = sorted(set(int(r['speaker_id']) for r in segment_results))
-            if final_ids != list(range(n_speakers)):
-                logger.error(f"❌ 映射后ID仍不连续: {final_ids}")
-            else:
-                # 检查第一个片段的ID
-                first_speaker_id = segment_results[0]['speaker_id'] if segment_results else "N/A"
-                logger.info(f"✅ 编号规范化完成: 0-{n_speakers-1}，第一个片段 speaker_id={first_speaker_id}")
-            
-            logger.info(f"✅ 说话人分离完成，识别出 {n_speakers} 个说话人（基于真实声纹聚类）")
-        
-        # ===== 步骤4：构建最终结果 =====
-        html_text = full_text  # 保持兼容性
+                        logger.info("ℹ️ 声纹库未配置或为空，跳过熟人检索，保留 SPEAKER_XX 标签")
+                        segment_results = diarized_transcript
+                except Exception as ve:
+                    logger.warning(f"⚠️ Cam++ 声纹检索环节出现异常，降级保留原标签: {ve}")
+                    segment_results = diarized_transcript
+                    
+            except Exception as e:
+                logger.error(f"❌ 说话人分离全流程失败: {e}", exc_info=True)
+                # 终极降级保障，保证接口不报错，会议纪要能出文字
+                for result in segment_results:
+                    if 'speaker_id' not in result:
+                        result['speaker_id'] = '0'
+
+        # ===== 步骤4：构建结果 =====
         transcript = segment_results
-        
-        # 清理 transcript 中的临时字段
         for item in transcript:
-            if 'segment_idx' in item:
-                del item['segment_idx']
-            if '_audio_data' in item:
-                del item['_audio_data']  # 清理缓存的音频数据
-        
-        logger.info(f"✅ 最终结果: {len(transcript)} 个片段, {len(set(t['speaker_id'] for t in transcript))} 个说话人")
-        
-        # 兼容旧的解析逻辑（以下代码不会执行，但保留以防万一）
-        if False:  # 禁用旧逻辑
-            result = {}
-            sentence_info = None
+            if 'segment_idx' in item: del item['segment_idx']
+            if '_audio_data' in item: del item['_audio_data']
             
-            if sentence_info and len(sentence_info) > 0:
-                logger.info(f"✅ 使用句子级别解析（含说话人识别）")
-                for sent in sentence_info:
-                    text = sent.get("text", "").strip()
-                    if not text:
-                        continue
-                    
-                    # 时间戳（毫秒）
-                    timestamps = sent.get("timestamp", [])
-                    if timestamps and len(timestamps) > 0:
-                        start_ms = timestamps[0][0] if isinstance(timestamps[0], list) else 0
-                        end_ms = timestamps[-1][1] if isinstance(timestamps[-1], list) else 0
-                    else:
-                        start_ms = 0
-                        end_ms = 0
-                    
-                    # 说话人ID（SenseVoiceSmall 使用 speaker_id 字段）
-                    speaker_id = str(sent.get("speaker_id", sent.get("spk", "0")))
-                    
-                    # ✅ 提取置信度（如果有）
-                    confidence = sent.get("confidence", None)
-                    
-                    item = {
-                        "text": text,
-                        "start_time": round(start_ms / 1000.0, 2),
-                        "end_time": round(end_ms / 1000.0, 2),
-                        "speaker_id": speaker_id
-                    }
-                    
-                    # 如果有置信度信息，添加到结果中
-                    if confidence is not None:
-                        item["confidence"] = round(confidence, 3)
-                    
-                    transcript.append(item)
-            
-            # ===== 方案2: 词级别（需要合并成句子） =====
-            else:
-                logger.warning("⚠️ 未检测到句子级信息，使用词级别合并")
-                raw_stamp = result.get("timestamp", [])
-                
-                if raw_stamp and len(raw_stamp) > 0:
-                    # 合并策略：遇到标点或停顿超过1秒则分句
-                    current_sentence = []
-                    current_start = None
-                    current_end = None
-                    sentence_count = 0
-                    
-                    for item in raw_stamp:
-                        if not isinstance(item, list) or len(item) < 2:
-                            continue
-                        
-                        t_range = item[0]
-                        word = str(item[-1]).strip()
-                        
-                        if not isinstance(t_range, list) or len(t_range) < 2:
-                            continue
-                        
-                        start_ms = t_range[0]
-                        end_ms = t_range[1]
-                        
-                        # 第一个词
-                        if current_start is None:
-                            current_start = start_ms
-                        
-                        current_sentence.append(word)
-                        current_end = end_ms
-                        
-                        # 分句条件：遇到标点符号
-                        if word in ["。", "？", "！", ".", "?", "!"]:
-                            sentence_text = "".join(current_sentence)
-                            if sentence_text and sentence_text not in ["。", "？", "！"]:
-                                sentence_count += 1
-                                transcript.append({
-                                    "text": sentence_text,
-                                    "start_time": round(current_start / 1000.0, 2),
-                                    "end_time": round(current_end / 1000.0, 2),
-                                    "speaker_id": str((sentence_count - 1) % 5 + 1)  # 假设最多5个人，循环分配
-                                })
-                            # 重置
-                            current_sentence = []
-                            current_start = None
-                    
-                    # 处理最后一句（没有标点结尾的）
-                    if current_sentence:
-                        sentence_text = "".join(current_sentence)
-                        if sentence_text:
-                            sentence_count += 1
-                            transcript.append({
-                                "text": sentence_text,
-                                "start_time": round(current_start / 1000.0, 2),
-                                "end_time": round(current_end / 1000.0, 2),
-                                "speaker_id": str((sentence_count - 1) % 5 + 1)
-                            })
-                    
-                    logger.info(f"📝 合并完成: {len(raw_stamp)}个词 -> {len(transcript)}个句子")
-                else:
-                    # 完全没有时间戳信息
-                    logger.warning("⚠️ 无时间戳信息，返回纯文本")
-                    transcript.append({
-                        "text": full_text,
-                        "start_time": 0.0,
-                        "end_time": 0.0,
-                        "speaker_id": "1"
-                    })
-
-        # 根据输入来源构造日志描述（file 可能为 None，例如通过 audio_url 调用时）
-        if file is not None and getattr(file, "filename", None):
-            src_desc = file.filename
-        elif isinstance(input_data, str) and input_data.startswith(("http://", "https://")):
-            src_desc = input_data
-        elif isinstance(input_data, str):
-            src_desc = input_data
-        else:
-            src_desc = "未知来源音频"
-
-        logger.info(f"✅ 识别成功: {src_desc} (长度: {len(full_text)}字)")
-        
-        # ===== 热词后处理替换（SenseVoiceSmall 专用）=====
-        # SenseVoiceSmall 不支持原生热词，需要在结果中进行文本替换
-        try:
-            if combined_hotwords:
-                hotword_svc = get_hotword_service()
-                # 读取 hotwords.json 文件获取 mappings
-                import json
-                hotwords_path = Path(__file__).parent / "hotwords.json"
-                if hotwords_path.exists():
-                    with open(hotwords_path, 'r', encoding='utf-8') as f:
-                        hotwords_data = json.load(f)
-                    mappings = hotwords_data.get("mappings", {})
-                else:
-                    mappings = {}
-                
-                if mappings:
-                    # 合并所有映射表
-                    all_mappings = {}
-                    for category, mapping_dict in mappings.items():
-                        if isinstance(mapping_dict, dict):
-                            all_mappings.update(mapping_dict)
-                    
-                    if all_mappings:
-                        logger.info(f"🔄 应用热词映射: {len(all_mappings)} 个")
-                        
-                        # 对 transcript 中的每个文本进行替换
-                        for item in transcript:
-                            text = item.get("text", "")
-                            for oral_form, standard_form in all_mappings.items():
-                                text = text.replace(oral_form, standard_form)
-                            item["text"] = text
-                        
-                        # 同时更新 full_text
-                        for oral_form, standard_form in all_mappings.items():
-                            full_text = full_text.replace(oral_form, standard_form)
-                        
-                        logger.info("✅ 热词替换完成")
-        except Exception as e:
-            logger.warning(f"⚠️ 热词替换失败: {e}")
-        
-        # ===== 注意：声纹匹配已移至主服务（app/api/endpoints.py）=====
-        # 声纹匹配应该在 Pyannote 说话人分离之后执行，用于识别说话人的真实身份
-        # 因此不再在 FunASR 服务中执行声纹匹配
-        
         return {
             "code": 0,
             "msg": "success",
             "text": full_text,
-            "html": html_text,
+            "html": full_text,
             "data": {
                 "text": full_text,
-                "html": html_text,
+                "html": full_text,
                 "transcript": transcript
             }
         }
 
     except Exception as e:
-        # 这里同样要考虑 file 可能为 None 的情况
-        err_src = None
-        if file is not None and getattr(file, "filename", None):
-            err_src = file.filename
-        elif "input_data" in locals():
-            err_src = str(input_data)
-        else:
-            err_src = "未知来源音频"
-
-        logger.error(f"❌ 识别出错: {err_src} - {str(e)}", exc_info=True)
+        logger.error(f"❌ 识别出错: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
         
     finally:
-        # 清理临时文件和变量
-        if temp_file_path and temp_file_path.exists():
-            try:
-                temp_file_path.unlink()
-            except Exception:
-                pass
-
-        if 'input_data' in locals(): del input_data
-        if 'res' in locals(): del res
-        
+        if temp_file_path and os.path.exists(temp_file_path):
+            try: os.remove(temp_file_path)
+            except: pass
+        if url_downloaded_file and os.path.exists(url_downloaded_file):
+            try: os.remove(url_downloaded_file)
+            except: pass
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-        logger.info("🧹 内存清理完成，准备迎接下一个任务")
+        logger.info("🧹 清理完成")
 
 
 # =============================================

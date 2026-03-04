@@ -18,7 +18,8 @@ class VectorService:
     
     def __init__(self):
         """初始化向量服务"""
-        self.collection_name = settings.CHROMA_COLLECTION_NAME
+        # 使用知识库表名（会议纪要），与声纹库分离
+        self.collection_name = settings.CHROMA_KNOWLEDGE_COLLECTION_NAME
         
         # 获取Embedding服务（根据配置自动选择）
         try:

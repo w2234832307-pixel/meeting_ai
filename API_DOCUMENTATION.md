@@ -2,9 +2,9 @@
 
 ## 基础信息
 
-- **Base URL**: `http://localhost:8001/api/v1`
+- **Base URL**: `http://192.168.20.170:8001/api/v1`
 - **API 版本**: v1
-- **文档地址**: http://localhost:8001/docs (Swagger UI)
+- **文档地址**: http://192.168.20.170:8001/docs (Swagger UI)
 
 ## 通用说明
 
@@ -40,15 +40,15 @@
 
 #### 请求参数
 
-##### 输入源（以下7种方式任选其一）
+##### 输入源
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `files` | File[] | 否 | 音频文件上传（支持 mp3/wav/m4a/mp4 等，支持多个文件） |
+| `files` | File[] | 否 | 音频文件上传（支持 mp3/wav/m4a/mp4 等，支持**多个文件并行处理**） |
 | `file_paths` | String | 否 | 本地文件路径（单个：`test_audio/meeting.mp3`，多个：`audio1.mp3,audio2.mp3`） |
 | `audio_urls` | String | 否 | 音频URL地址（要求可公网访问，单个或逗号分隔多个） |
 | `audio_id` | Integer | 否 | 数据库音频ID（用于处理已存储的历史音频） |
-| `document_file` | File | 否 | 文档文件上传（支持 Word .docx / PDF .pdf / 文本 .txt） |
+| `document_urls` | String | 否 | 文档URL列表，作为参考材料（支持 Word .docx / PDF .pdf / 文本 .txt，多条使用逗号分隔） |
 | `text_content` | String | 否 | 纯文本内容（直接输入会议文本，跳过语音识别） |
 
 ##### 模板参数
@@ -83,7 +83,7 @@
 
 **示例1：上传音频文件**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
   -F "files=@meeting.mp3" \
   -F "template=default" \
   -F "asr_model=funasr"
@@ -91,36 +91,37 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 
 **示例2：使用本地文件路径**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
   -F "file_paths=test_audio/meeting.mp3" \
   -F "template=default"
 ```
 
 **示例3：使用音频URL（腾讯云ASR）**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
   -F "audio_urls=https://example.com/meeting.mp3" \
   -F "template=default" \
   -F "asr_model=tencent"
 ```
 
-**示例4：上传文档文件**
+**示例4：通过文档URL作为参考材料**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
-  -F "document_file=@meeting.docx" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
+  -F "audio_urls=https://example.com/meeting.mp3" \
+  -F "document_urls=https://example.com/meeting_agenda.docx,https://example.com/background.pdf" \
   -F "template=default"
 ```
 
 **示例5：直接输入文本**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
   -F "text_content=今天会议讨论了产品迭代计划..." \
   -F "template=default"
 ```
 
 **示例6：带历史会议参考**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170:8001/api/v1/process" \
   -F "files=@meeting.mp3" \
   -F "template=default" \
   -F "history_meeting_ids=100,101,102" \
@@ -139,18 +140,29 @@ curl -X POST "http://localhost:8001/api/v1/process" \
       "text": "会议开始",
       "start_time": 0.0,
       "end_time": 1.5,
-      "speaker_id": 0
+      "speaker_id": 0,
+      "audio_name": "meeting_part1.mp3"
     },
     {
       "text": "今天讨论产品迭代",
       "start_time": 1.5,
       "end_time": 5.2,
-      "speaker_id": 1
+      "speaker_id": "张三",
+      "audio_name": "meeting_part1.mp3"
     }
   ],
   "need_rag": true,
   "html_content": "<h1>会议纪要</h1><p>...</p>",
-  "usage_tokens": 1500
+  "usage_tokens": 1500,
+  "speaker_summaries": {
+    "张三": {
+      "speaker_id": "张三",
+      "speaker_name": "张三",
+      "summary": "张三主要汇报了项目当前进展、资源风险以及下一步排期计划……",
+      "word_count": 1200,
+      "speech_segments": 18
+    }
+  }
 }
 ```
 
@@ -165,10 +177,17 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 | `transcript[].text` | String | 文本内容 |
 | `transcript[].start_time` | Float | 开始时间（秒） |
 | `transcript[].end_time` | Float | 结束时间（秒） |
-| `transcript[].speaker_id` | Integer | 说话人ID（如果启用说话人分离） |
+| `transcript[].speaker_id` | String / Integer | 说话人标识（数字ID或声纹匹配后的真实姓名） |
+| `transcript[].audio_name` | String | 来源音频文件名或URL标识（用于区分多音频来源） |
 | `need_rag` | Boolean | 是否触发了历史检索 |
 | `html_content` | String | HTML格式的纪要 |
 | `usage_tokens` | Integer | LLM 消耗的 token 数 |
+| `speaker_summaries` | Object | 按说话人聚合的发言摘要（键为说话人ID或姓名） |
+| `speaker_summaries[*.speaker_id]` | String | 说话人标识 |
+| `speaker_summaries[*.speaker_name]` | String | 说话人姓名（如有声纹匹配） |
+| `speaker_summaries[*.summary]` | String | 该说话人的发言摘要（Markdown/HTML友好） |
+| `speaker_summaries[*.word_count]` | Integer | 该说话人的总字数 |
+| `speaker_summaries[*.speech_segments]` | Integer | 该说话人的发言段数 |
 
 ---
 
@@ -189,7 +208,7 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 #### 请求示例
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/archive" \
+curl -X POST "http://192.168.20.170:8001/api/v1/archive" \
   -H "Content-Type: application/json" \
   -d '{
     "minutes_id": 123,
@@ -228,15 +247,36 @@ curl -X POST "http://localhost:8001/api/v1/archive" \
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `file` | File | 是 | 员工录音文件（wav/mp3） |
+| `file` | File | 否 | 员工录音文件（wav/mp3），与 `audio_url`/`file_path` 三选一 |
+| `audio_url` | String | 否 | 音频文件URL地址（HTTP/HTTPS），与 `file`/`file_path` 三选一 |
+| `file_path` | String | 否 | 本地音频文件路径，与 `file`/`audio_url` 三选一 |
 | `name` | String | 是 | 员工姓名 |
 | `employee_id` | String | 是 | 员工工号（唯一标识） |
 
+**注意**：`file`、`audio_url` 和 `file_path` 必须三选一，不能同时提供。
+
 #### 请求示例
 
+**示例1：文件上传**
 ```bash
-curl -X POST "http://localhost:8001/api/v1/api/voice/register" \
+curl -X POST "http://192.168.20.170:8001/api/v1/api/voice/register" \
   -F "file=@employee_voice.wav" \
+  -F "name=张三" \
+  -F "employee_id=EMP001"
+```
+
+**示例2：使用URL地址**
+```bash
+curl -X POST "http://192.168.20.170:8001/api/v1/api/voice/register" \
+  -F "audio_url=https://example.com/employee_voice.wav" \
+  -F "name=张三" \
+  -F "employee_id=EMP001"
+```
+
+**示例3：使用本地文件路径**
+```bash
+curl -X POST "http://192.168.20.170:8001/api/v1/api/voice/register" \
+  -F "file_path=D:/WorkSpace/Company/project/meeting_ai/test_audio/新录音 92.m4a" \
   -F "name=张三" \
   -F "employee_id=EMP001"
 ```
@@ -273,7 +313,14 @@ curl -X POST "http://localhost:8001/api/v1/api/voice/register" \
 | `message` | String | 提示信息 |
 | `data.employee_id` | String | 员工工号 |
 | `data.name` | String | 员工姓名 |
-| `data.vector_dim` | Integer | 声纹向量维度（通常为192） |
+| `data.vector_dim` | Integer | 声纹向量维度 |
+
+#### 音频质量要求
+
+- **时长**：2-60 秒（推荐 5-30 秒的个人连续发声）
+- **采样率**：8-48 kHz（推荐 16 kHz）
+- **格式**：支持 wav, mp3, m4a, aac, flac 等常见音频格式
+- **质量**：音频应清晰，无明显噪音，包含足够的语音内容
 
 ---
 
@@ -286,7 +333,7 @@ curl -X POST "http://localhost:8001/api/v1/api/voice/register" \
 #### 请求示例
 
 ```bash
-curl -X GET "http://localhost:8001/api/v1/api/hotwords"
+curl -X GET "http://192.168.20.170:8001/api/v1/api/hotwords"
 ```
 
 #### 响应示例
@@ -319,7 +366,7 @@ curl -X GET "http://localhost:8001/api/v1/api/hotwords"
 #### 请求示例
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/api/hotwords/reload"
+curl -X POST "http://192.168.20.170:8001/api/v1/api/hotwords/reload"
 ```
 
 #### 响应示例
@@ -337,6 +384,65 @@ curl -X POST "http://localhost:8001/api/v1/api/hotwords/reload"
   }
 }
 ```
+
+---
+
+## 5. 文档解析接口
+
+### POST /api/v1/api/document/parse
+
+解析模板文件（Word/PDF/文本），返回带格式的 HTML5 内容。
+
+#### 请求参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file` | File | 否 | 模板文件上传（支持 .docx, .pdf, .txt），与 `file_url` 二选一 |
+| `file_url` | String | 否 | 模板文件URL地址（HTTP/HTTPS），与 `file` 二选一 |
+
+**注意**：`file` 和 `file_url` 必须二选一，不能同时提供。
+
+#### 请求示例
+
+**示例1：文件上传**
+```bash
+curl -X POST "http://192.168.20.170:8001/api/v1/api/document/parse" \
+  -F "file=@template.docx"
+```
+
+**示例2：使用URL地址**
+```bash
+curl -X POST "http://192.168.20.170:8001/api/v1/api/document/parse" \
+  -F "file_url=https://example.com/template.pdf"
+```
+
+#### 响应示例
+
+```json
+{
+  "code": 200,
+  "message": "解析成功",
+  "data": {
+    "filename": "template.docx",
+    "html_content": "<!DOCTYPE html>..."
+  }
+}
+```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | Integer | 状态码：200（成功）/ 400（失败）/ 500（错误） |
+| `message` | String | 提示信息 |
+| `data.filename` | String | 文件名 |
+| `data.html_content` | String | HTML5 格式的内容（保留原始格式） |
+
+#### 支持格式
+
+- **.docx**: 使用 `mammoth` 转换为语义化 HTML
+- **.pdf**: 优先使用 `pdf2htmlEX` 高保真还原，否则退化为文本 HTML
+- **.txt**: 简单包装为 `<pre>` 格式的 HTML
 
 ---
 
@@ -369,8 +475,8 @@ curl -X POST "http://localhost:8001/api/v1/api/hotwords/reload"
    - 支持格式：mp3, wav, m4a, mp4 等
 
 2. **文件大小限制**：
-   - 默认最大文件大小：500MB
-   - 可通过环境变量 `MAX_FILE_SIZE_MB` 配置
+   - 默认最大文件大小：500MB（`MAX_FILE_SIZE_MB` 默认值）
+   - 可通过环境变量 `MAX_FILE_SIZE_MB` 配置，例如设置为 `1024` 可支持约 1GB 音频文件
 
 3. **音频时长限制**：
    - 腾讯云ASR：最长5小时（18000秒）
@@ -385,10 +491,17 @@ curl -X POST "http://localhost:8001/api/v1/api/hotwords/reload"
    - 热词配置文件位于 `funasr_standalone/hotwords.json`
    - 修改后需要调用 `/api/v1/api/hotwords/reload` 重新加载
 
+6. **向量数据库表名配置**：
+   - **声纹库表名**：`CHROMA_COLLECTION_NAME`（默认：`employee_voice_library`）
+     - 用于存储员工声纹向量，用于说话人识别
+   - **知识库表名**：`CHROMA_KNOWLEDGE_COLLECTION_NAME`（默认：`meeting_knowledge_base`）
+     - 用于存储会议纪要向量，用于RAG检索
+   - ⚠️ **重要**：两个表名必须不同，否则数据会混乱
+
 ---
 
 ## 更多信息
 
-- **Swagger UI**: http://localhost:8001/docs
-- **ReDoc**: http://localhost:8001/redoc
+- **Swagger UI**: http://192.168.20.170:8001/docs
+- **ReDoc**: http://192.168.20.170:8001/redoc
 - **项目 README**: [README.md](README.md)

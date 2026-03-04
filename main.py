@@ -3,7 +3,10 @@ FastAPI 应用入口文件
 """
 import os
 import sys
+import time
+import glob
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
@@ -18,14 +21,50 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, 'buffer'):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# 创建 FastAPI 应用实例
+
+# 👇 1. 定义全局清理函数
+def global_temp_sweep(temp_dir: str, max_age_hours: int = 2):
+    """全局兜底清扫：清理存活时间超过指定小时数的废弃文件"""
+    try:
+        now = time.time()
+        search_pattern = os.path.join(temp_dir, "*")
+        cleaned_count = 0
+        for file_path in glob.glob(search_pattern):
+            if os.path.isfile(file_path):
+                file_mtime = os.path.getmtime(file_path)
+                if (now - file_mtime) > (max_age_hours * 3600):
+                    try:
+                        os.remove(file_path)
+                        cleaned_count += 1
+                    except:
+                        pass
+        if cleaned_count > 0:
+            logger.info(f"♻️ 全局垃圾回收完成，清理了 {cleaned_count} 个滞留临时文件")
+    except Exception as e:
+        logger.error(f"❌ 全局临时文件清扫失败: {e}")
+
+
+# 👇 2. 定义生命周期
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时执行：打扫上一次崩溃可能遗留的战场
+    logger.info("🧹 执行启动前的磁盘清理...")
+    # 确保 TEMP_DIR 存在
+    os.makedirs(settings.TEMP_DIR, exist_ok=True)
+    global_temp_sweep(str(settings.TEMP_DIR), max_age_hours=2)
+    yield
+    # 关闭服务时执行的内容写在这里
+
+
+# 👇 3. 唯一一次创建 FastAPI 应用实例，并挂载 lifespan
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="会议AI服务 - 支持语音转文字、智能总结、RAG检索"
+    description="会议AI服务 - 支持语音转文字、智能总结、RAG检索",
+    lifespan=lifespan
 )
 
-# 配置 CORS（如果需要前端跨域访问）
+# 👇 4. 挂载中间件和路由
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 生产环境应该配置具体域名
@@ -33,8 +72,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 注册路由
 app.include_router(router, prefix="/api/v1", tags=["会议处理"])
 
 # 在启动时初始化 Pyannote 服务（如果配置了）
@@ -86,9 +123,6 @@ if __name__ == "__main__":
     logger.info(f"📁 日志路径: {settings.LOG_DIR}")
     logger.info(f"🔌 监听端口: {port}")
     
-    # uvicorn配置
-    # 注意：reload=True 会导致日志输出到子进程，主终端看不到
-    # 如果需要看到完整日志，请使用 reload=False
     reload_mode = os.getenv("RELOAD", "false").lower() == "true"
     
     if reload_mode:

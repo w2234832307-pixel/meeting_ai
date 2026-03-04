@@ -50,7 +50,10 @@ class Settings:
     VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE", "chroma")
     CHROMA_HOST: str = os.getenv("CHROMA_HOST", "192.168.211.74")
     CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8000"))
+    # 声纹库表名（用于员工声纹识别）
     CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "employee_voice_library")
+    # 知识库表名（用于会议纪要归档）
+    CHROMA_KNOWLEDGE_COLLECTION_NAME: str = os.getenv("CHROMA_KNOWLEDGE_COLLECTION_NAME", "meeting_knowledge_base")
     
     # --- Pyannote 说话人分离服务（可选，方案B：独立服务）---
     # 示例：PYANNOTE_SERVICE_URL=http://localhost:8100
@@ -166,7 +169,9 @@ class Settings:
             if not self.CHROMA_HOST:
                 errors.append("CHROMA_HOST 未配置")
             if not self.CHROMA_COLLECTION_NAME:
-                errors.append("CHROMA_COLLECTION_NAME 未配置")
+                errors.append("CHROMA_COLLECTION_NAME 未配置（声纹库）")
+            if not self.CHROMA_KNOWLEDGE_COLLECTION_NAME:
+                errors.append("CHROMA_KNOWLEDGE_COLLECTION_NAME 未配置（知识库）")
         
         if errors:
             error_msg = "配置验证失败:\n" + "\n".join(f"  - {e}" for e in errors)

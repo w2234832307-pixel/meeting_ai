@@ -4,19 +4,26 @@ BGE-M3本地Embedding服务
 """
 from typing import List, Optional
 import numpy as np
-
+import os
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.exceptions import VectorServiceException
 from app.core.utils import retry_with_backoff
+import sys
+import traceback
 
-# BGE-M3相关导入（延迟导入，避免未安装时报错）
 try:
+    # 尝试强制导入
     from FlagEmbedding import BGEM3FlagModel
     BGE_M3_AVAILABLE = True
-except ImportError:
+    logger.info("✅ FlagEmbedding 导入检测成功")
+except Exception as e:
     BGE_M3_AVAILABLE = False
-    logger.warning("⚠️ FlagEmbedding 未安装，无法使用BGE-M3本地Embedding服务")
+    logger.error("❌ FlagEmbedding 导入失败诊断：")
+    logger.error(f"错误类型: {type(e).__name__}")
+    logger.error(f"错误信息: {str(e)}")
+    logger.error(traceback.format_exc())
+    logger.debug(f"当前 Python 解释器: {sys.executable}")
 
 
 class BGEM3EmbeddingService:
@@ -30,18 +37,31 @@ class BGEM3EmbeddingService:
             )
         
         try:
-            logger.info("🚀 正在加载BGE-M3模型...")
+            # 1. 获取当前文件(bge_m3_embedding.py)的绝对路径
+            current_file = os.path.abspath(__file__)
+            # 2. 向上回退三层，找到项目根目录 
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_file)))
+            # 3. 拼接本地模型路径
+            local_model_path = os.path.join(project_root, "models", "bge-m3")
             
-            # 加载BGE-M3模型
+            # 4. 智能判断：如果本地有模型就用本地的，没有则尝试使用 settings 里的默认配置
+            if os.path.exists(local_model_path):
+                model_to_load = local_model_path
+                logger.info(f"📂 检测到本地模型，将从此处加载: {model_to_load}")
+            else:
+                model_to_load = settings.BGE_M3_MODEL_NAME
+                logger.warning(f"⚠️ 本地路径 {local_model_path} 未找到模型，尝试在线加载/缓存加载: {model_to_load}")
+
+            logger.info(f"🚀 正在加载BGE-M3模型: {model_to_load}...")
+            
+            # 使用计算出的路径加载
             self.model = BGEM3FlagModel(
-                settings.BGE_M3_MODEL_NAME,
-                use_fp16=settings.BGE_M3_USE_FP16,  # 使用半精度可以节省显存
-                device=settings.BGE_M3_DEVICE  # cpu / cuda
+                model_to_load,  # 动态路径
+                use_fp16=settings.BGE_M3_USE_FP16,
+                device=settings.BGE_M3_DEVICE
             )
             
-            # BGE-M3的维度是1024
             self.dim = 1024
-            
             logger.info(f"✅ BGE-M3模型加载成功 (设备: {settings.BGE_M3_DEVICE}, 维度: {self.dim})")
             
         except Exception as e:

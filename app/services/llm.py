@@ -370,12 +370,6 @@ class LLMService:
         logger.info("💬 LLM Chat 调用...")
         
         try:
-            print("-" * 30)
-            print(f"🕵️ [Debug] 正在请求的 API 地址 (Base URL): {self.client.base_url}") 
-            print(f"🕵️ [Debug] 使用的模型名称: {self.model}")                           
-            key_preview = str(self.client.api_key)[:8] if self.client.api_key else "None"
-            print(f"🕵️ [Debug] 使用的 API Key: {key_preview}...")                      
-            print("-" * 30)
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],

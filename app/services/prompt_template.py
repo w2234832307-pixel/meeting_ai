@@ -151,6 +151,21 @@ class PromptTemplateService:
                 mapping_section = mappings_text
                 logger.info("✅ 已加载名称映射表到提示词")
             
+            # 4. 参考文档部分（用户上传的附件）
+            reference_document_section = ""
+            reference_document = kwargs.get("reference_document")
+            if reference_document and reference_document.strip():
+                # 构建参考文档部分
+                reference_document_section = f"""
+## 📎 参考文档（用户上传的附件）
+以下内容来自用户上传的参考文档，请结合这些信息生成会议纪要：
+
+{reference_document[:5000]}  # 限制长度避免超出token限制
+
+---
+"""
+                logger.info(f"✅ 已加载参考文档到提示词，长度: {len(reference_document)} 字符")
+            
             # === 渲染最终 Prompt ===
             try:
                 main_template = Template(prompt_template)
@@ -162,7 +177,8 @@ class PromptTemplateService:
                     "history_section": history_section,
                     "requirement_section": requirement_section,
                     "mapping_section": mapping_section,
-                    **kwargs  # 其他自定义变量
+                    "reference_document_section": reference_document_section,  # 新增：参考文档部分
+                    **kwargs  # 其他自定义变量（包括 reference_document）
                 }
                 
                 final_prompt = main_template.render(**render_vars)
@@ -170,7 +186,8 @@ class PromptTemplateService:
                 logger.info(
                     f"✅ 模板渲染成功 "
                     f"(历史: {'✓' if history_section else '✗'}, "
-                    f"需求: {'✓' if requirement_section else '✗'})"
+                    f"需求: {'✓' if requirement_section else '✗'}, "
+                    f"参考文档: {'✓' if reference_document_section else '✗'})"
                 )
                 
                 return final_prompt
@@ -341,6 +358,73 @@ class PromptTemplateService:
             # 清理可能的干扰字符
             cleaned = prompt_template.strip().strip('"').strip("'")
             
+            # ⭐ 如果是URL，支持从URL加载模板内容（可为纯文本或文档）
+            if cleaned.startswith(("http://", "https://")):
+                try:
+                    import requests
+                    import tempfile
+                    import os
+                    from app.services.document import document_service
+
+                    logger.info(f"🔗 检测到自定义模板URL: {cleaned}")
+                    resp = requests.get(cleaned, timeout=15)
+                    resp.raise_for_status()
+
+                    # 根据URL后缀或Content-Type判断是否按文档处理
+                    url_path = cleaned.split("?", 1)[0]
+                    lower_path = url_path.lower()
+                    content_type = resp.headers.get("Content-Type", "").lower()
+
+                    is_doc = lower_path.endswith((".docx", ".pdf", ".txt")) or any(
+                        t in content_type
+                        for t in [
+                            "application/pdf",
+                            "application/vnd.openxmlformats-officedocument",
+                            "application/msword",
+                            "text/plain",
+                        ]
+                    )
+
+                    template_content = ""
+                    if is_doc:
+                        # 保存到临时文件再用 document_service 解析
+                        suffix = os.path.splitext(url_path)[1] or ".txt"
+                        tmp_dir = tempfile.gettempdir()
+                        tmp_path = os.path.join(
+                            tmp_dir, f"tmpl_{uuid.uuid4().hex}{suffix}"
+                        )
+                        with open(tmp_path, "wb") as f:
+                            f.write(resp.content)
+                        try:
+                            template_content = document_service.extract_text_from_file(
+                                tmp_path
+                            )
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                    else:
+                        # 直接按文本模板使用
+                        template_content = resp.text
+
+                    if template_content and template_content.strip():
+                        logger.info(
+                            f"✅ 成功从URL加载自定义模板内容，长度: {len(template_content)}"
+                        )
+                        return {
+                            "template_id": "custom_from_url",
+                            "template_name": f"URL模板: {cleaned}",
+                            "prompt_template": template_content,
+                            "variables": {},
+                            "dynamic_sections": {},
+                        }
+                    else:
+                        logger.error("❌ URL模板内容为空")
+                except Exception as e:
+                    logger.error(f"❌ 从URL加载自定义模板失败: {e}")
+                    # 继续往下走，尝试其他方式或使用默认模板
+            
             # ⭐ 检查是否是文档路径（支持 .docx, .pdf, .txt）
             if cleaned.lower().endswith(('.docx', '.pdf', '.txt')):
                 logger.info(f"📂 检测到模板文档路径: {cleaned}")
@@ -458,6 +542,70 @@ class PromptTemplateService:
         if template_id and template_id.strip():
             cleaned_tid = template_id.strip().strip('"').strip("'")
             
+            # ⭐ template_id 也支持 URL（下载后作为模板使用）
+            if cleaned_tid.startswith(("http://", "https://")):
+                try:
+                    import requests
+                    import tempfile
+                    import os
+                    from app.services.document import document_service
+
+                    logger.info(f"🔗 检测到 template_id 为URL: {cleaned_tid}")
+                    resp = requests.get(cleaned_tid, timeout=15)
+                    resp.raise_for_status()
+
+                    url_path = cleaned_tid.split("?", 1)[0]
+                    lower_path = url_path.lower()
+                    content_type = resp.headers.get("Content-Type", "").lower()
+
+                    is_doc = lower_path.endswith((".docx", ".pdf", ".txt")) or any(
+                        t in content_type
+                        for t in [
+                            "application/pdf",
+                            "application/vnd.openxmlformats-officedocument",
+                            "application/msword",
+                            "text/plain",
+                        ]
+                    )
+
+                    template_content = ""
+                    if is_doc:
+                        suffix = os.path.splitext(url_path)[1] or ".txt"
+                        tmp_dir = tempfile.gettempdir()
+                        tmp_path = os.path.join(
+                            tmp_dir, f"tmpl_{uuid.uuid4().hex}{suffix}"
+                        )
+                        with open(tmp_path, "wb") as f:
+                            f.write(resp.content)
+                        try:
+                            template_content = document_service.extract_text_from_file(
+                                tmp_path
+                            )
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                    else:
+                        template_content = resp.text
+
+                    if template_content and template_content.strip():
+                        logger.info(
+                            f"✅ 成功从URL加载 template_id 模板内容，长度: {len(template_content)}"
+                        )
+                        return {
+                            "template_id": "custom_from_url",
+                            "template_name": f"URL模板: {cleaned_tid}",
+                            "prompt_template": template_content,
+                            "variables": {},
+                            "dynamic_sections": {},
+                        }
+                    else:
+                        logger.error("❌ template_id URL 模板内容为空")
+                except Exception as e:
+                    logger.error(f"❌ 从 template_id URL 加载模板失败: {e}")
+                    # 失败后继续按原有逻辑处理（本地路径或默认模板）
+
             if cleaned_tid.lower().endswith(('.docx', '.pdf', '.txt')):
                 logger.info(f"📂 检测到template_id是文档路径: {cleaned_tid}")
                 
