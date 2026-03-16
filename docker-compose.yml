@@ -1,0 +1,346 @@
+version: '3.8'
+
+services:
+  # FunASR服务 - GPU 0
+  funasr-gpu0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu0
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+  # FunASR服务 - GPU 1
+  funasr-gpu1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu1
+    ports:
+      - "8003:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+  # FunASR服务 - GPU 2
+  funasr-gpu2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu2
+    ports:
+      - "8004:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+
+  # FunASR服务 - GPU 3
+  funasr-gpu3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu3
+    ports:
+      - "8005:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['3']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+
+  # FunASR服务 - GPU 4
+  funasr-gpu4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu4
+    ports:
+      - "8006:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+
+  # FunASR服务 - GPU 5
+  funasr-gpu5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu5
+    ports:
+      - "8007:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['5']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+
+  # FunASR服务 - GPU 6
+  funasr-gpu6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: funasr-gpu6
+    ports:
+      - "8008:8002"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['6']
+              capabilities: [gpu]
+    command: python funasr_standalone/main.py --port 8002
+
+
+
+  # Pyannote服务 - GPU 0
+  pyannote-gpu0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu0
+    ports:
+      - "8100:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 1
+  pyannote-gpu1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu1
+    ports:
+      - "8101:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 2
+  pyannote-gpu2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu2
+    ports:
+      - "8102:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 3
+  pyannote-gpu3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu3
+    ports:
+      - "8103:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['3']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 4
+  pyannote-gpu4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu4
+    ports:
+      - "8104:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 5
+  pyannote-gpu5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu5
+    ports:
+      - "8105:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['5']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+  # Pyannote服务 - GPU 6
+  pyannote-gpu6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: pyannote-gpu6
+    ports:
+      - "8106:8100"
+    volumes:
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['6']
+              capabilities: [gpu]
+    command: python funasr_standalone/pyannote_server.py --port 8100
+
+
+
+  # 主服务
+  meeting-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meeting-ai:latest
+    container_name: meeting-ai
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env  # 从 .env 文件加载环境变量（推荐方式）
+    environment:
+      - FUNASR_SERVICE_URL=http://funasr-gpu0:8002/api/v1  # 默认URL，实际会动态选择
+      - PYANNOTE_SERVICE_URL=http://pyannote-gpu0:8100  # 默认URL，实际会动态选择
+      - MAX_FUNASR_GPU_INSTANCES=7  # FunASR/Pyannote GPU 实例数量（funasr-gpu0 到 funasr-gpu6）
+      # 注意：LLM_API_KEY、LLM_BASE_URL、LLM_MODEL_NAME 等敏感配置建议通过 .env 文件传递
+      # 如果 .env 文件不存在，可以在这里直接添加（不推荐，因为会暴露密钥）：
+      # - LLM_API_KEY=your-api-key-here
+      # - LLM_BASE_URL=https://api.deepseek.com
+      # - LLM_MODEL_NAME=deepseek-chat
+    volumes:
+      # 挂载日志和临时文件目录（可选，方便查看日志）
+      - ./logs:/app/logs
+      - ./temp_files:/app/temp_files
+      - ./models:/app/models
+      - ./modelscope_cache:/root/.cache/modelscope
+    depends_on:
+      - funasr-gpu0
+      - funasr-gpu1
+      - funasr-gpu2
+      - funasr-gpu3
+      - funasr-gpu4
+      - funasr-gpu5
+      - funasr-gpu6
+      - pyannote-gpu0
+      - pyannote-gpu1
+      - pyannote-gpu2
+      - pyannote-gpu3
+      - pyannote-gpu4
+      - pyannote-gpu5
+      - pyannote-gpu6

@@ -14,6 +14,73 @@
 - 🔄 **灵活切换**：ASR和LLM服务均支持云端API与本地部署无缝切换
 - 🔥 **热词管理**：支持动态热词配置，提升识别准确率
 
+## 🧱 系统整体架构图（服务间调用关系）
+
+```text
+             ┌──────────────────────────┐
+             │        前端 / 客户端     │
+             │  Web / 移动端 / 内部系统 │
+             └───────────┬─────────────┘
+                         │  HTTP / REST
+                         ▼
+             ┌──────────────────────────┐
+             │   Meeting AI 主服务      │
+             │   (FastAPI, main.py)    │
+             ├──────────────────────────┤
+             │ /api/v1/process          │
+             │ /api/v1/archive          │
+             │ /api/v1/api/voice/...    │
+             └───────┬─────────┬────────┘
+                     │         │
+   选择 ASR 引擎     │         │          调用 LLM / Embedding
+     (asr_factory)   │         │          (llm_factory / embedding_factory)
+                     │         │
+     ┌───────────────┘         └───────────────────────────────┐
+     ▼                                                         ▼
+┌──────────────┐                                      ┌─────────────────┐
+│ 腾讯云 ASR    │                                      │ LLM 服务         │
+│ (云端 API)   │                                      │ DeepSeek /      │
+└──────────────┘                                      │ OpenAI / Qwen3  │
+                                                      └─────────────────┘
+     ┌──────────────────────────────────────────────────────────┐
+     │                  FunASR / Pyannote 集群                 │
+     │        (docker-compose: funasr-gpuX / pyannote-gpuX)    │
+     └───────────────┬────────────────────────────┬────────────┘
+                     │                            │
+                     ▼                            ▼
+           ┌───────────────────┐        ┌──────────────────────┐
+           │ FunASR 服务       │        │ Pyannote 服务         │
+           │ funasr_standalone │        │ pyannote_server.py   │
+           │ main.py (8002)    │        │ (8100)               │
+           └─────────┬─────────┘        └──────────┬───────────┘
+                     │                             │
+                     │ 字/词级时间戳 transcript    │ RTTM 说话人片段
+                     └──────────────┬──────────────┘
+                                    ▼
+                         ┌──────────────────────┐
+                         │ 并行处理模块         │
+                         │ parallel_processor   │
+                         └─────────┬────────────┘
+                                   │  按说话人聚合、补齐时间轴
+                                   ▼
+                         ┌──────────────────────┐
+                         │ 声纹识别服务         │
+                         │ VoiceService         │
+                         └─────────┬────────────┘
+                                   │  调用 Cam++ 模型 + Chroma 声纹库
+                                   ▼
+                         ┌──────────────────────┐
+                         │ 员工身份匹配结果     │
+                         └──────────────────────┘
+
+                  ┌────────────────────────────────────────┐
+                  │ 向量数据库 / 知识库 (Chroma)           │
+                  │ - 员工声纹库 (voice embeddings)       │
+                  │ - 历史会议纪要 / 文档 embedding       │
+                  └────────────────────────────────────────┘
+```
+
+
 ## 🚀 快速开始
 
 ### 1. 环境要求
@@ -77,15 +144,15 @@ ASR_SERVICE_TYPE=funasr  # 或 tencent
 python main.py
 ```
 
-服务启动后访问：**http://localhost:8001/docs** 查看API文档
+服务启动后访问：**http://192.168.20.170/docs** 查看API文档
 
 ### 5. 测试服务
 
-访问 Swagger UI：http://localhost:8001/docs
+访问 Swagger UI：http://192.168.20.170/docs
 
 或使用 curl：
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170/api/v1/process" \
   -F "text_content=今天会议讨论了产品迭代计划" \
   -F "template=default"
 ```
@@ -203,7 +270,7 @@ CHROMA_COLLECTION_NAME=employee_voice_library
 ### 1. 处理音频文件
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170/api/v1/process" \
   -F "files=@meeting.mp3" \
   -F "template=default" \
   -F "asr_model=funasr"
@@ -212,7 +279,7 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 ### 2. 处理文档文件
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170/api/v1/process" \
   -F "document_file=@meeting.docx" \
   -F "template=default"
 ```
@@ -220,7 +287,7 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 ### 3. 处理纯文本
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/process" \
+curl -X POST "http://192.168.20.170/api/v1/process" \
   -F "text_content=今天会议讨论了..." \
   -F "template=default"
 ```
@@ -228,7 +295,7 @@ curl -X POST "http://localhost:8001/api/v1/process" \
 ### 4. 归档到知识库
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/archive" \
+curl -X POST "http://192.168.20.170/api/v1/archive" \
   -H "Content-Type: application/json" \
   -d '{
     "minutes_id": 123,
@@ -240,7 +307,7 @@ curl -X POST "http://localhost:8001/api/v1/archive" \
 ### 5. 注册员工声纹
 
 ```bash
-curl -X POST "http://localhost:8001/api/v1/api/voice/register" \
+curl -X POST "http://192.168.20.170/api/v1/api/voice/register" \
   -F "file=@employee_voice.wav" \
   -F "name=张三" \
   -F "employee_id=EMP001"
@@ -290,7 +357,7 @@ HOTWORDS_JSON_PATH=/path/to/hotwords.json
 
 ### 开发环境 vs 生产环境
 
-- **开发环境**：`http://localhost:8001`（仅本地访问）
+- **开发环境**：`http://192.168.20.170`
 - **生产环境**：需要部署到服务器，配置反向代理（Nginx）
 
 ### 部署方式
@@ -343,16 +410,6 @@ HOTWORDS_JSON_PATH=/path/to/hotwords.json
 ### Q6: 音频时长限制是多少？
 **A**: 最长5小时（18000秒），这是腾讯云API的限制。FunASR 本地服务无此限制。
 
-## 📝 更新日志
-
-### v1.0.0 (2026-01-22)
-- ✅ 完成阿里云到腾讯云ASR迁移
-- ✅ 添加说话人分离和时间戳支持
-- ✅ 添加 Word/PDF 文档解析
-- ✅ 实现智能RAG判断
-- ✅ 实现模板化输出
-- ✅ 添加声纹识别功能
-- ✅ 工业级代码重构
 
 ## 📞 技术支持
 

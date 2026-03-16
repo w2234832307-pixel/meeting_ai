@@ -82,7 +82,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import soundfile as sf
-
+from typing import Optional
 import requests  
 from urllib.parse import urlparse 
 import uuid
@@ -258,7 +258,9 @@ async def transcribe_word_level(
     file: UploadFile = File(None),  # 文件上传（可选）
     audio_path: str = Form(None),  # 音频文件路径（可选）
     audio_url: str = Form(None),   # 音频URL（可选）
-    hotword: str = Form("")
+    hotword: str = Form(""),
+    return_format: str = Form("words"),  # 返回格式：words（字级别时间戳）或 raw_text（完整文本）
+    device: Optional[str] = Form(None)  # GPU设备（如 "cuda:0", "cuda:1"），如果未指定则使用默认设备
 ) -> dict:
     """
     字级别 ASR 识别接口（用于并行处理）
@@ -268,7 +270,9 @@ async def transcribe_word_level(
     2. audio_path: 本地文件路径
     3. audio_url: 音频URL
     
-    返回字级别时间戳，格式: [{"char": "你", "start": 0.5, "end": 0.6}, ...]
+    返回格式（通过 return_format 参数控制）：
+    - words（默认）：字级别时间戳，格式: [{"char": "你", "start": 0.5, "end": 0.6}, ...]
+    - raw_text：完整文本字符串
     """
     from word_level_asr import extract_word_level_timestamps
     
@@ -279,6 +283,8 @@ async def transcribe_word_level(
     
     try:
         # === 1. 处理输入 ===
+        # 优先级：file > audio_url > audio_path
+        # 注意：audio_path 和 audio_url 可能都是字符串，需要判断哪个是有效的
         if file:
             logger.info(f"📥 接收到文件上传: {file.filename}")
             suffix = Path(file.filename).suffix if file.filename else ".mp3"
@@ -287,20 +293,29 @@ async def transcribe_word_level(
                 temp_file_path = Path(t_file.name)
             input_data = str(temp_file_path)
             
-        elif audio_path:
-            logger.info(f"📂 接收到本地文件路径: {audio_path}")
-            if not os.path.exists(audio_path):
-                return {"code": 1, "msg": f"文件不存在: {audio_path}", "words": []}
-            input_data = audio_path.strip()
+        elif audio_url and audio_url.strip() and not audio_url.strip().lower() == "none" and not audio_url.strip().lower() == "null":
+            # 优先检查 audio_url（如果提供了且不是空字符串或"none"/"null"）
+            # 检查是否是有效的URL格式
+            audio_url_clean = audio_url.strip()
+            if audio_url_clean.startswith(("http://", "https://")):
+                logger.info(f"🔗 接收到音频 URL: {audio_url_clean}")
+                # ✅ 修复核心：调用辅助函数下载
+                try:
+                    url_downloaded_file = download_audio_from_url(audio_url_clean)
+                    input_data = url_downloaded_file # 将处理目标指向下载好的本地文件
+                except Exception as e:
+                    return {"code": 1, "msg": f"URL下载失败: {str(e)}", "words": []}
+            else:
+                # 如果不是URL格式，可能是误传，返回错误
+                return {"code": 1, "msg": f"audio_url 格式错误，必须是 http:// 或 https:// 开头的URL: {audio_url_clean}", "words": []}
             
-        elif audio_url:
-            logger.info(f"🔗 接收到音频 URL: {audio_url}")
-            # ✅ 修复核心：调用辅助函数下载
-            try:
-                url_downloaded_file = download_audio_from_url(audio_url)
-                input_data = url_downloaded_file # 将处理目标指向下载好的本地文件
-            except Exception as e:
-                return {"code": 1, "msg": f"URL下载失败: {str(e)}", "words": []}
+        elif audio_path and audio_path.strip() and not audio_path.strip().lower() == "none" and not audio_path.strip().lower() == "null":
+            # 检查 audio_path（如果提供了且不是空字符串或"none"/"null"）
+            audio_path_clean = audio_path.strip()
+            logger.info(f"📂 接收到本地文件路径: {audio_path_clean}")
+            if not os.path.exists(audio_path_clean):
+                return {"code": 1, "msg": f"文件不存在: {audio_path_clean}", "words": []}
+            input_data = audio_path_clean
                 
         else:
             return {"code": 1, "msg": "参数错误", "words": []}
@@ -311,6 +326,10 @@ async def transcribe_word_level(
             if processed_input != input_data:
                 logger.info("✅ 使用预处理后的音频")
                 input_data = processed_input
+        
+        # 如果指定了GPU设备，记录日志（实际GPU切换需要模型实例管理，当前使用默认设备）
+        if device:
+            logger.info(f"🎯 请求指定GPU设备: {device} (注意：当前服务使用启动时加载的设备，如需多GPU支持请启动多个服务实例)")
         
         # === 使用 VAD 分段，避免长音频显存溢出 ===
         logger.info(f"🎤 开始字级别识别（VAD分段模式）: {input_data}")
@@ -579,11 +598,25 @@ async def transcribe_word_level(
         all_words.sort(key=lambda x: x["start"])
         
         logger.info(f"✅ 字级别识别完成: {len(all_words)} 个字")
-        return {
-            "code": 0,
-            "msg": "success",
-            "words": all_words
-        }
+        
+        # 根据 return_format 参数决定返回格式
+        if return_format and return_format.lower() in ["raw_text", "text", "raw"]:
+            # 返回完整文本
+            raw_text = "".join([word.get("char", "") for word in all_words])
+            logger.info(f"📝 返回格式: raw_text (长度: {len(raw_text)} 字符)")
+            return {
+                "code": 0,
+                "msg": "success",
+                "raw_text": raw_text,
+                "words": all_words  # 同时返回words，方便需要时使用
+            }
+        else:
+            # 返回字级别时间戳（默认）
+            return {
+                "code": 0,
+                "msg": "success",
+                "words": all_words
+            }
         
     except Exception as e:
         logger.error(f"❌ 字级别识别失败: {e}")
@@ -661,6 +694,7 @@ async def transcribe(
 
     try:
         # === 逻辑判断 ===
+        # 优先级：file > audio_url > audio_path
         if file:
             logger.info(f"📥 接收到文件上传: {file.filename}")
             suffix = Path(file.filename).suffix
@@ -669,11 +703,16 @@ async def transcribe(
                 temp_file_path = Path(t_file.name)
             input_data = str(temp_file_path)
 
-        elif audio_url:
-            logger.info(f"🔗 接收到音频 URL: {audio_url}")
-            # ✅ 修复核心：这里必须下载！否则 VAD 会卡死！
-            url_downloaded_file = download_audio_from_url(audio_url)
-            input_data = url_downloaded_file 
+        elif audio_url and audio_url.strip() and not audio_url.strip().lower() in ["none", "null", "string"]:
+            # 优先检查 audio_url（如果提供了且不是空字符串或无效值）
+            audio_url_clean = audio_url.strip()
+            if audio_url_clean.startswith(("http://", "https://")):
+                logger.info(f"🔗 接收到音频 URL: {audio_url_clean}")
+                # ✅ 修复核心：这里必须下载！否则 VAD 会卡死！
+                url_downloaded_file = download_audio_from_url(audio_url_clean)
+                input_data = url_downloaded_file
+            else:
+                raise HTTPException(status_code=400, detail=f"audio_url 格式错误，必须是 http:// 或 https:// 开头的URL: {audio_url_clean}") 
             
         else:
             raise HTTPException(status_code=400, detail="必须提供 file 或 audio_url")
@@ -1107,5 +1146,12 @@ async def reload_hotwords():
 app.include_router(router)
 
 if __name__ == "__main__":
-    logger.info("🚀 启动 HTTP 服务: http://0.0.0.0:8002")
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="FunASR 独立服务")
+    parser.add_argument("--port", type=int, default=8002, help="服务端口 (默认: 8002)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="服务地址 (默认: 0.0.0.0)")
+    args = parser.parse_args()
+    
+    logger.info(f"🚀 启动 HTTP 服务: http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)

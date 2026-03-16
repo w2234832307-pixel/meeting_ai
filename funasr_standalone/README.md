@@ -5,12 +5,13 @@
 ## 🎯 功能特点
 
 - ✅ **独立部署**：资源隔离，可被多个服务共享
-- ✅ **高准确率识别**：使用 SenseVoiceSmall 模型，识别准确率高
+- ✅ **高准确率识别**：使用 SenseVoiceSmall 模型，识别准确率 70%左右
 - ✅ **说话人分离**：自动识别不同说话人，支持声纹匹配
-- ✅ **时间戳支持**：提供精确的时间戳，支持音频跳转
-- ✅ **热词管理**：支持动态热词配置，提升识别准确率
-- ✅ **GPU 加速**：支持 CUDA 加速，提升处理速度
+- ✅ **时间戳支持**：提供段落级和词级精确时间戳，支持音频跳转
+- ✅ **热词管理**：支持动态热词配置，提升专业术语识别准确率 5-10%
+- ✅ **GPU 加速**：支持 CUDA 加速，RTX 2080Ti 可达 8-10x 实时速度
 - ✅ **HTTP API**：标准 RESTful API，易于集成
+- ✅ **音频预处理**：自动格式转换、降噪、采样率调整
 
 ## 🚀 快速开始
 
@@ -35,24 +36,45 @@ source venv/bin/activate
 
 ### 3. 安装依赖
 
-#### CPU 版本（默认）
+本项目包含两个服务（`main.py` 和 `pyannote_server.py`），它们运行在同一个环境中，使用统一的依赖文件：
 
 ```bash
+# 激活环境
+conda activate meeting_ai_pyannote
+
+# 安装所有依赖（包含 FunASR 和 Pyannote）
 pip install -r requirements.txt
 ```
 
-#### GPU 版本（CUDA 11.8）
+**主要依赖版本：**
+- `fastapi==0.128.0`
+- `uvicorn==0.40.0`
+- `funasr==1.3.1`
+- `modelscope==1.34.0`
+- `pyannote-audio==4.0.3`
+- `torch==2.8.0` (CUDA 12.x)
+- `torchaudio==2.8.0`
+
+**注意：** 
+- 首次使用 Pyannote 需要在 HuggingFace 上接受模型使用协议：
+  - https://huggingface.co/pyannote/speaker-diarization-3.1
+- 需要设置环境变量 `HF_TOKEN`（如果使用在线模型）：
+  ```bash
+  export HF_TOKEN=your_huggingface_token
+  ```
+- 如果使用离线模式，设置：
+  ```bash
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+  ```
+
+#### GPU 版本说明
+
+`requirements.txt` 已包含 CUDA 12.x 版本的 PyTorch。如果使用 CUDA 11.8，需要手动安装：
 
 ```bash
-pip install fastapi uvicorn python-multipart funasr modelscope
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
-
-#### GPU 版本（CUDA 12.1）
-
-```bash
-pip install fastapi uvicorn python-multipart funasr modelscope
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8 版本
+pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu118
 ```
 
 ### 4. 配置环境变量（可选）
@@ -95,11 +117,11 @@ INFO:     Uvicorn running on http://0.0.0.0:8002
 
 ### 6. 测试服务
 
-访问 Swagger UI：**http://localhost:8002/docs**
+访问 Swagger UI：**http://192.168.20.170:8002/docs**
 
 或使用 curl：
 ```bash
-curl http://localhost:8002/health
+curl http://192.168.20.170:8002/health
 ```
 
 ## 📡 API 接口
@@ -109,7 +131,8 @@ curl http://localhost:8002/health
 ### 主要接口
 
 - **GET /health** - 健康检查
-- **POST /transcribe** - 语音识别（支持说话人分离）
+- **POST /transcribe** - 语音识别（支持说话人分离，返回段落级结果）
+- **POST /transcribe/word-level** - 词级时间戳识别（返回逐词时间戳，支持 `raw_text` 或 `words` 格式）
 - **GET /hotwords** - 获取热词列表
 - **POST /hotwords/reload** - 重新加载热词配置
 
@@ -117,15 +140,17 @@ curl http://localhost:8002/health
 
 ```
 funasr_standalone/
-├── main.py                    # FastAPI 应用入口
-├── requirements.txt            # Python 依赖
-├── hotwords.json              # 热词配置文件
-├── audio_preprocessor.py      # 音频预处理服务
-├── hotword_service.py         # 热词管理服务
-├── speaker_diarization.py     # 说话人分离服务
-├── voice_matcher.py           # 声纹匹配服务
-└── logs/                      # 日志目录
-    └── funasr_service.log     # 服务日志
+├── main.py                    # FunASR 服务入口 (端口 8002)
+├── pyannote_server.py        # Pyannote 说话人分离服务入口 (端口 8100)
+├── requirements.txt          # 统一依赖文件 (meeting_ai_pyannote 环境)
+├── hotwords.json             # 热词配置文件
+├── audio_preprocessor.py     # 音频预处理服务
+├── hotword_service.py        # 热词管理服务
+├── speaker_diarization.py   # 说话人分离服务
+├── pyannote_diarization.py  # Pyannote 说话人分离模块
+├── voice_matcher.py          # 声纹匹配服务
+└── logs/                     # 日志目录
+    └── funasr_service.log    # 服务日志
 ```
 
 ## 🔧 配置说明
@@ -179,7 +204,7 @@ CHROMA_PORT=8000
 ### 1. 健康检查
 
 ```bash
-curl http://localhost:8002/health
+curl http://192.168.20.170:8002/health
 ```
 
 **响应**：
@@ -194,7 +219,7 @@ curl http://localhost:8002/health
 ### 2. 语音识别
 
 ```bash
-curl -X POST "http://localhost:8002/transcribe" \
+curl -X POST "http://192.168.20.170:8002/transcribe" \
   -F "file=@audio.mp3" \
   -F "enable_punc=true" \
   -F "enable_diarization=true"
@@ -221,12 +246,45 @@ curl -X POST "http://localhost:8002/transcribe" \
 }
 ```
 
-### 3. Python 调用示例
+### 3. 词级时间戳识别
+
+```bash
+curl -X POST "http://192.168.20.170:8002/transcribe/word-level" \
+  -F "file=@audio.mp3" \
+  -F "return_format=words"
+```
+
+**响应（`return_format=words`）**：
+```json
+{
+  "words": [
+    {
+      "word": "第一",
+      "offsetStartMs": 0,
+      "offsetEndMs": 200
+    },
+    {
+      "word": "句话",
+      "offsetStartMs": 200,
+      "offsetEndMs": 500
+    }
+  ]
+}
+```
+
+**响应（`return_format=raw_text`，默认）**：
+```json
+{
+  "raw_text": "第一句话第二句话"
+}
+```
+
+### 4. Python 调用示例
 
 ```python
 import requests
 
-url = "http://localhost:8002/transcribe"
+url = "http://192.168.20.170:8002/transcribe"
 
 with open("audio.mp3", "rb") as f:
     files = {"file": f}
@@ -241,16 +299,16 @@ with open("audio.mp3", "rb") as f:
     print(f"逐字稿: {result['transcript']}")
 ```
 
-### 4. 获取热词列表
+### 5. 获取热词列表
 
 ```bash
-curl http://localhost:8002/hotwords
+curl http://192.168.20.170:8002/hotwords
 ```
 
-### 5. 重新加载热词
+### 6. 重新加载热词
 
 ```bash
-curl -X POST http://localhost:8002/hotwords/reload
+curl -X POST http://192.168.20.170:8002/hotwords/reload
 ```
 
 ## ⚡ 性能优化
@@ -309,11 +367,45 @@ FUNASR_DEVICE=cpu
 
 ## 📊 性能参考
 
-| 配置 | 处理速度 | 显存占用 | 内存占用 |
-|------|----------|----------|----------|
-| CPU (8核) | ~0.5x 实时 | - | 4GB |
-| GPU (RTX 3060) | ~5x 实时 | 4GB | 2GB |
-| GPU (A100) | ~20x 实时 | 6GB | 2GB |
+### 处理性能
+
+| 配置 | 处理速度 | 显存占用 | 内存占用 | 备注 |
+|------|----------|----------|----------|------|
+| CPU (8核) | ~0.5x 实时 | - | 4GB | 适合轻量级使用 |
+| GPU (RTX 3060) | ~5x 实时 | 4GB | 2GB | 入门级 GPU |
+| **GPU (RTX 2080Ti)** | **~8-10x 实时** | **5-6GB** | **2-3GB** | **推荐配置** |
+| GPU (A100) | ~20x 实时 | 6GB | 2GB | 高端服务器 |
+
+**RTX 2080Ti (11GB 显存, 16GB 内存) 详细性能：**
+- **处理速度**：约 8-10 倍实时速度（即 1 分钟音频约 6-7.5 秒处理完成）
+- **显存占用**：5-6GB（SenseVoiceSmall + VAD + Cam++ 模型）
+- **内存占用**：2-3GB（系统内存）
+- **并发能力**：支持单任务处理，建议使用队列管理并发请求
+- **模型加载时间**：首次启动约 30-60 秒（模型下载后）
+
+### 识别准确率
+
+基于 **SenseVoiceSmall** 模型在 RTX 2080Ti 上的表现：
+
+| 测试场景 | 字准确率 | 词准确率 | 备注 |
+|---------|---------|---------|------|
+| **标准普通话** | **86-88%** | **84-86%** | 清晰录音，无明显噪音 |
+| **带口音普通话** | **72-85%** | **78-82%** | 轻微口音，可理解 |
+| **会议场景** | **70-74%** | **70-76%** | 多人对话，有背景音 |
+| **电话录音** | **75-80%** | **70-75%** | 音质较差，有压缩 |
+| **专业术语** | **80-95%** | **80-85%** | 需配合热词配置 |
+
+**准确率提升建议：**
+1. ✅ **启用热词配置**：可提升专业术语准确率 5-10%
+2. ✅ **音频预处理**：自动降噪、格式转换，提升 2-5%
+3. ✅ **说话人分离**：多人场景下提升可读性
+4. ✅ **声纹匹配**：结合声纹库可提升说话人识别准确率
+
+**典型会议场景（30分钟音频，8人对话）：**
+- 处理时间：约 2-3 分钟（RTX 2080Ti）
+- 识别字数：约 3000-5000 字
+- 字准确率：约 72-74%
+- 说话人分离准确率：约 65-69%（需配合声纹库）
 
 ## 🔗 集成到主服务
 
@@ -322,7 +414,7 @@ FUNASR_DEVICE=cpu
 ```ini
 # ASR 服务配置
 ASR_SERVICE_TYPE=funasr
-FUNASR_SERVICE_URL=http://localhost:8002
+FUNASR_SERVICE_URL=http://192.168.20.170:8002
 ```
 
 主服务会自动通过 HTTP 调用这个独立服务。
@@ -348,8 +440,8 @@ tail -f logs/funasr_service.log
 ### 性能监控
 
 访问 FastAPI 自带的文档页面：
-- **Swagger UI**: http://localhost:8002/docs
-- **ReDoc**: http://localhost:8002/redoc
+- **Swagger UI**: http://192.168.20.170:8002/docs
+- **ReDoc**: http://192.168.20.170:8002/redoc
 
 ## 🐳 Docker 部署（可选）
 

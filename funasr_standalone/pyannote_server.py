@@ -163,7 +163,8 @@ def _extract_annotation(diarization):
 async def get_rttm(
     audio_path: Optional[str] = Form(None),
     audio_url: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    device: Optional[str] = Form(None),  # 与主服务传入的 device 参数对齐，避免 NameError
 ) -> RTTMResponse:
     """
     获取 RTTM 格式结果（用于并行处理）
@@ -174,8 +175,16 @@ async def get_rttm(
     """
     hf_token = os.getenv("HF_TOKEN") or None
 
+    # 如果指定了GPU设备，记录日志（实际GPU切换需要模型实例管理，当前使用默认设备）
+    if device:
+        logger.info(
+            f"🎯 请求指定GPU设备: {device} "
+            f"(当前版本通过多实例部署区分 GPU，接口中的 device 仅用于日志记录)"
+        )
+
     try:
         # 获取 pipeline (优先读 offline_config.yaml)
+        # TODO: 支持多GPU需要为每张GPU创建独立的pipeline实例
         pipeline = get_pyannote_pipeline(use_auth_token=hf_token)
 
         if pipeline is None:
@@ -358,7 +367,25 @@ async def get_rttm(
         return RTTMResponse(rttm="", error=str(e))
 
 
-gpu_semaphore = asyncio.Semaphore(2)
+# 动态初始化GPU并发控制：根据GPU数量自动调整
+def _init_gpu_semaphore():
+    """根据GPU数量动态初始化Semaphore"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            # 每张GPU最大并发1（避免显存溢出）
+            max_concurrent = gpu_count
+            logger.info(f"🚀 Pyannote服务：检测到 {gpu_count} 张GPU，设置并发数: {max_concurrent}")
+            return asyncio.Semaphore(max_concurrent)
+        else:
+            logger.info("⚠️ Pyannote服务：未检测到GPU，使用CPU模式，并发数: 1")
+            return asyncio.Semaphore(1)
+    except Exception as e:
+        logger.warning(f"⚠️ GPU检测失败，使用默认并发数: {e}")
+        return asyncio.Semaphore(2)
+
+gpu_semaphore = _init_gpu_semaphore()
 
 @app.post("/diarize", response_model=DiarizeResponse)
 async def diarize(req: DiarizeRequest) -> DiarizeResponse:
@@ -408,9 +435,16 @@ async def diarize(req: DiarizeRequest) -> DiarizeResponse:
 
 if __name__ == "__main__":
     import uvicorn
+    import argparse
     
-    host = os.getenv("PYANNOTE_HOST", "0.0.0.0")
-    port = int(os.getenv("PYANNOTE_PORT", "8100"))
+    parser = argparse.ArgumentParser(description="Pyannote 说话人分离服务")
+    parser.add_argument("--port", type=int, default=None, help="服务端口 (默认: 从环境变量 PYANNOTE_PORT 或 8100)")
+    parser.add_argument("--host", type=str, default=None, help="服务地址 (默认: 从环境变量 PYANNOTE_HOST 或 0.0.0.0)")
+    args = parser.parse_args()
+    
+    # 优先使用命令行参数，其次使用环境变量，最后使用默认值
+    host = args.host or os.getenv("PYANNOTE_HOST", "0.0.0.0")
+    port = args.port or int(os.getenv("PYANNOTE_PORT", "8100"))
     
     print(f"\n🚀 Pyannote 服务启动中...")
     print(f"👉 监听: http://{host}:{port}")

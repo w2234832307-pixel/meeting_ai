@@ -74,6 +74,7 @@ app.add_middleware(
 )
 app.include_router(router, prefix="/api/v1", tags=["会议处理"])
 
+
 # 在启动时初始化 Pyannote 服务（如果配置了）
 try:
     from app.services.pyannote_service import get_pyannote_service

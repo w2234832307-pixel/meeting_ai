@@ -200,7 +200,8 @@ class TencentASRService:
                     
                     return {
                         "text": "".join([i['text'] for i in final_result]), 
-                        "transcript": final_result
+                        "transcript": final_result,
+                        "task_id": str(task_id)  # 返回腾讯云的TaskId作为流水号
                     }
                 
                 elif status == 3:

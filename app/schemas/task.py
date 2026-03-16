@@ -6,10 +6,11 @@ from typing import Optional, Union
 
 class TranscriptItem(BaseModel):
     text: str = Field(..., description="文本内容")
-    start_time: float = Field(..., description="开始时间（秒）")
-    end_time: float = Field(..., description="结束时间（秒）")
+    start_time: int = Field(..., description="开始时间（毫秒）")
+    end_time: int = Field(..., description="结束时间（毫秒）")
     speaker_id: Optional[Union[str, int]] = Field(None, description="说话人名称或ID")
-    audio_name: Optional[str] = Field(None, description="来源音频文件名或URL标识")
+    audio_id: Optional[Union[str, int]] = Field(None, description="来源音频的业务ID（如有），否则为音频文件名或URL标识")
+    asr_task_id: Optional[str] = Field(None, description="ASR识别任务的流水号（唯一标识）")
 
 # 说话人摘要数据模型
 class SpeakerSummary(BaseModel):
@@ -42,10 +43,12 @@ class MeetingResponse(BaseModel):
     html_content: Optional[str] = Field(None, description="HTML格式的纪要")
     
     # 消耗的 Token (方便你统计成本)
-    usage_tokens: int = Field(0, description="LLM 消耗的 token 数")
+    usage_tokens: int = Field(0, description="LLM 总共消耗的 token 数（输入+输出）")
+    input_tokens: int = Field(0, description="LLM 输入 prompt token 数")
+    output_tokens: int = Field(0, description="LLM 输出 completion token 数")
     
-    # 说话人摘要（新增）
-    speaker_summaries: Optional[Dict[str, SpeakerSummary]] = Field(None, description="各说话人的发言摘要")
+    # 说话人摘要（新增，数组格式）
+    speaker_summaries: Optional[List[SpeakerSummary]] = Field(None, description="各说话人的发言摘要（数组格式）")
 
 class ArchiveRequest(BaseModel):
     minutes_id: int = Field(..., description="MySQL里的会议纪要ID (minutes_draft_id)")

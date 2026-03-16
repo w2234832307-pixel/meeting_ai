@@ -5,6 +5,7 @@ FunASR语音识别服务
 2. 本地模式：直接加载模型（需要安装 funasr）
 """
 import time
+import uuid
 import requests
 from typing import Dict, Any
 from pathlib import Path
@@ -175,8 +176,33 @@ class FunASRService:
                 # 兼容直接返回 text 和 transcript 的格式
                 result = response_data
             
+            # 提取流水号（如果三方服务返回了task_id或request_id）
+            task_id = None
+            if "task_id" in response_data:
+                task_id = str(response_data["task_id"])
+            elif "request_id" in response_data:
+                task_id = str(response_data["request_id"])
+            elif "data" in response_data and isinstance(response_data["data"], dict):
+                if "task_id" in response_data["data"]:
+                    task_id = str(response_data["data"]["task_id"])
+                elif "request_id" in response_data["data"]:
+                    task_id = str(response_data["data"]["request_id"])
+            
+            # 如果三方服务没有返回流水号，生成一个唯一标识
+            if not task_id:
+                task_id = str(uuid.uuid4())
+                logger.info(f"📝 本地FunASR生成唯一标识: {task_id}")
+            else:
+                logger.info(f"📝 FunASR服务返回流水号: {task_id}")
+            
+            # 将流水号添加到结果中
+            if isinstance(result, dict):
+                result["task_id"] = task_id
+            else:
+                result = {"text": result.get("text", ""), "transcript": result.get("transcript", []), "task_id": task_id}
+            
             text_length = len(result.get('text', ''))
-            logger.info(f"✅ [HTTP模式] 识别完成 | 耗时:{elapsed:.2f}s | 字数:{text_length}")
+            logger.info(f"✅ [HTTP模式] 识别完成 | 耗时:{elapsed:.2f}s | 字数:{text_length} | 流水号:{task_id}")
             
             return result
             
@@ -237,11 +263,15 @@ class FunASRService:
                             "speaker_id": str(s.get('spk', '1'))
                         })
             
-            logger.info(f"✅ [本地模式] 识别完成 | 耗时:{elapsed:.2f}s | 字数:{len(full_text)}")
+            # 本地模式生成唯一标识
+            task_id = str(uuid.uuid4())
+            logger.info(f"📝 本地FunASR生成唯一标识: {task_id}")
+            logger.info(f"✅ [本地模式] 识别完成 | 耗时:{elapsed:.2f}s | 字数:{len(full_text)} | 流水号:{task_id}")
             
             return {
                 "text": full_text,
-                "transcript": transcript_data
+                "transcript": transcript_data,
+                "task_id": task_id
             }
             
         except Exception as e:

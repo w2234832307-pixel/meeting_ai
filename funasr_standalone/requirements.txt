@@ -1,58 +1,108 @@
 # ==============================================
 # FunASR 独立服务依赖
+# 环境: meeting_ai_pyannote
+# 支持服务: main.py (FunASR) 和 pyannote_server.py (Pyannote)
 # ==============================================
 
 # FastAPI 框架
-fastapi==0.109.0
-uvicorn==0.27.0
-python-multipart==0.0.9
-python-dotenv>=1.0.0
+fastapi==0.128.0
+uvicorn==0.40.0
+python-multipart==0.0.22
+python-dotenv==1.2.1
+pydantic==2.12.5
+pydantic_core==2.41.5
+starlette==0.50.0
+
+# HTTP 请求
+requests==2.32.5
+httpx==0.28.1
+httpcore==1.0.9
 
 # FunASR 及其依赖
-funasr>=1.3.0
-modelscope>=1.33.0
+funasr==1.3.1
+modelscope==1.34.0
 
-# CPU 版本（默认）：
-torch>=2.0.0
-torchaudio>=2.0.0
+# Pyannote 说话人分离（核心依赖）
+pyannote-audio==4.0.3
+pyannote-core==6.0.1
+pyannote-database==6.1.1
+pyannote-metrics==4.0.0
+pyannote-pipeline==4.0.0
+pyannoteai-sdk==0.4.0
+
+# PyTorch (CUDA 12.x)
+torch==2.8.0
+torchaudio==2.8.0
+torchmetrics==1.8.2
+pytorch-lightning==2.6.1
+lightning==2.6.1
+lightning-utilities==0.15.2
+
+# 音频处理
+soundfile==0.13.1
+librosa==0.11.0
+soxr==1.0.0
+torch-audiomentations==0.12.0
+torch-complex==0.4.4
+torch_pitch_shift==1.2.5
+torchcodec==0.7.0
 
 # 说话人分离和声纹识别依赖
-numpy>=1.24.0
-scikit-learn>=1.3.0
-simplejson>=3.19.0  # modelscope 依赖
-sortedcontainers>=2.4.0  # modelscope/chromadb 依赖
-soundfile>=0.12.0  # 音频内存处理（优化）
+numpy==2.2.6
+scipy==1.15.3
+scikit-learn==1.7.2
+simplejson==3.20.2
+sortedcontainers==2.4.0
 
-# Pyannote 说话人分离（可选，专业模型）
-# pyannote.audio>=3.1.0  # 取消注释以启用Pyannote
-# 注意：首次使用需要在 HuggingFace 上接受模型使用协议
-# https://huggingface.co/pyannote/speaker-diarization-3.1
-PyYAML>=6.0  # 用于修改 Pyannote 配置文件以使用本地子模型
+# PyYAML 配置
+PyYAML==6.0.3
 
 # ChromaDB 声纹库
 chromadb==0.5.0
-datasets>=2.17.0
+datasets==2.19.1
 
-# GPU 版本（如果有 NVIDIA GPU）：
-# CUDA 11.8:
-# torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
-# torchaudio>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+# HuggingFace 相关
+huggingface_hub==0.36.2
+transformers==4.44.2
+# tokenizers==0.22.2
+safetensors==0.7.0
 
-# CUDA 12.1:
-# torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
-# torchaudio>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+# 数据处理
+pandas==2.3.3
+tqdm==4.67.2
+filelock==3.20.3
+
+# 其他依赖
+omegaconf==2.3.0
+hydra-core==1.3.2
+einops==0.8.2
+opt-einsum==3.3.0
+sentencepiece==0.2.1
+numba==0.64.0
+llvmlite==0.46.0
+networkx==3.4.2
+matplotlib==3.10.8
+pillow==12.1.0
 
 # ==============================================
 # 安装说明：
 # 
-# 1. CPU 版本（默认）：
+# 1. 基础安装（CPU/GPU 通用）：
+#    conda activate meeting_ai_pyannote
 #    pip install -r requirements.txt
 #
-# 2. GPU 版本（CUDA 11.8）：
-#    pip install fastapi uvicorn python-multipart funasr modelscope
-#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 2. GPU 版本（如果使用 CUDA 12.x，torch 已包含 CUDA 支持）：
+#    直接安装即可，torch==2.8.0 已包含 CUDA 12.x 支持
 #
-# 3. GPU 版本（CUDA 12.1）：
-#    pip install fastapi uvicorn python-multipart funasr modelscope
-#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# 3. 如果需要 CUDA 11.8：
+#    pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu118
+#
+# 4. Pyannote 首次使用注意事项：
+#    - 需要在 HuggingFace 上接受模型使用协议
+#      https://huggingface.co/pyannote/speaker-diarization-3.1
+#    - 需要设置环境变量 HF_TOKEN（如果使用在线模型）：
+#      export HF_TOKEN=your_huggingface_token
+#    - 如果使用离线模式，设置：
+#      export HF_HUB_OFFLINE=1
+#      export TRANSFORMERS_OFFLINE=1
 # ==============================================

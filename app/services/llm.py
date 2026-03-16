@@ -57,8 +57,9 @@ def remove_thinking_tags(text: str) -> str:
     # 移除空的 <p> 标签
     text = re.sub(r'<p>\s*</p>', '', text)
     
-    # 移除开头的无用标签和空白
-    text = re.sub(r'^[\s"<>/\n]*', '', text)
+    # 移除开头的无用标签和空白（保留真正的HTML起始标签，如 <p>）
+    # 这里不再删除 '<' 和 '>'，避免把正常的 <p ...> 变成 p ...
+    text = re.sub(r'^[\s"\n]*', '', text)
     
     # 移除多余的空白行
     text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
@@ -79,6 +80,16 @@ def add_highlighting(text: str) -> str:
     """
     if not text:
         return text
+
+    # 如果内容本身就是合法 JSON（例如说话人摘要的结构化输出），为了避免破坏 JSON 结构，直接跳过高亮
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            json.loads(stripped)
+            return text
+        except Exception:
+            # 不是纯 JSON，再继续后面的高亮逻辑
+            pass
 
     # 定义样式
     STYLES = {
@@ -152,6 +163,13 @@ class LLMService:
         self.api_key = api_key or settings.LLM_API_KEY
         self.base_url = base_url or settings.LLM_BASE_URL
         self.model = model_name or settings.LLM_MODEL_NAME
+        # 最近一次调用的 token 使用情况（用于上层统计）
+        self.last_usage: Optional[Dict[str, int]] = None
+        
+        # 检查 API Key 是否配置
+        if not self.api_key or self.api_key.strip() == "":
+            logger.warning("⚠️ LLM_API_KEY 未配置！请在 .env 文件或 docker-compose.yml 中设置")
+            logger.warning("   示例：LLM_API_KEY=sk-xxxxxxxxxxxxx")
         
         # 初始化 OpenAI 客户端 (兼容 DeepSeek)
         self.client = OpenAI(
@@ -161,6 +179,12 @@ class LLMService:
         
         logger.info(f"🕵️‍♂️ LLM 连接地址: {self.base_url}")
         logger.info(f"🤖 使用模型: {self.model}")
+        if self.api_key and self.api_key.strip() != "":
+            # 只显示前4位和后4位，中间用*代替
+            masked_key = self.api_key[:4] + "*" * (len(self.api_key) - 8) + self.api_key[-4:] if len(self.api_key) > 8 else "***"
+            logger.info(f"🔑 API Key: {masked_key}")
+        else:
+            logger.warning("⚠️ API Key 为空，LLM 调用将失败")
 
     def judge_rag(self, raw_text: str, template_id: str) -> dict:
         """
@@ -266,15 +290,8 @@ class LLMService:
             logger.info("📄 识别到自定义模板内容，使用动态提示词构建...")
             
             user_input = f"""
-请根据以下录音文本，严格按照【会议纪要模板】的格式生成内容。
-
 {user_requirement_section}
 
-----------------
-【会议纪要模板结构】(请完全照搬此结构填充)：
-{template_id}
-
-----------------
 【历史背景资料 (RAG)】：
 {context if context else "无"}
 
@@ -283,7 +300,16 @@ class LLMService:
 {raw_text}
 
 ----------------
-请开始生成：
+👇👇👇 最重要的指令在下面 👇👇👇
+
+请仔细阅读上方的【会议录音转录文本】。
+现在，请你严格使用上面的录音内容，来填充下方这个【会议纪要模板】。
+⚠️ 再次警告：模板中的“(待补充)”等字眼必须被替换为真实内容，如果录音里没提到，请写“会议未提及”，绝不能保留“待补充”！
+
+【会议纪要模板结构】(请保持原样标题，只填充内容)：
+{template_id}
+
+请直接输出填充后的 Markdown 结果：
 """
         else:
             # === 情况 B: 传入的是 default 这种简短 ID ===
@@ -319,9 +345,22 @@ class LLMService:
             # 添加高亮标记
             content = add_highlighting(content)
             
-            usage = response.usage
-            tokens = (usage.total_tokens if usage else 0)
-            logger.info(f"✅ 生成完成，消耗 Token: {tokens}")
+            usage = getattr(response, "usage", None)
+            if usage:
+                total_tokens = getattr(usage, "total_tokens", 0) or 0
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                self.last_usage = {
+                    "total_tokens": int(total_tokens),
+                    "prompt_tokens": int(prompt_tokens),
+                    "completion_tokens": int(completion_tokens),
+                }
+                logger.info(
+                    f"✅ 生成完成，Token 使用：输入={prompt_tokens}，输出={completion_tokens}，总计={total_tokens}"
+                )
+            else:
+                self.last_usage = None
+                logger.info("✅ 生成完成，但未返回 Token 使用信息")
             return content
         except Exception as e:
             logger.error(f"❌ 生成失败: {e}")
@@ -355,41 +394,86 @@ class LLMService:
         }
         return templates.get(template_id, templates["default"])
     
-    def chat(self, prompt: str, temperature: float = 0.7, max_tokens: int = 2000) -> str:
+    def chat(self, prompt: str, temperature: float = 0.3, max_tokens: int = 2000) -> str:
         """
-        简单的聊天接口（用于新的动态模板系统）
-        
-        Args:
-            prompt: 完整的提示词
-            temperature: 生成温度
-            max_tokens: 最大token数
-        
-        Returns:
-            模型生成的文本
+        完善后的聊天接口：强制注入系统指令，修复参数覆盖问题
         """
         logger.info("💬 LLM Chat 调用...")
         
+        # 1. 强制注入强大的 System Prompt（系统护栏）
+        system_instruction = """
+你是一名拥有10年经验的高级会议秘书。你的任务是根据【会议录音转录文本】来填充【会议纪要模板】。
+⚠️ 核心操作指南：
+1. 严禁复读占位符：绝对不允许在输出中出现“（待补充）”、“（此处需补充内容）”等原模板的提示语。
+2. 智能信息对齐：
+   - 对于会议时间、地点、人员，如果录音中没有明确提到，请结合语境简单推断，或填写“录音未明确”。
+   - 重点：如果模板要求提炼某人（如“陈总”、“张总”）的发言，而文本中只有“SPEAKER_00”等代号，请你根据上下文语境，智能寻找最匹配的说话人，并详实提炼其核心观点！不要死板地填“未提及”！
+3. 内容必须丰满：对于各部门的工作通报、决策和后续跟进，请把具体的痛点、数据和方案详细写出来，尽可能详尽，绝不能一笔带过！
+4. 严格输出 Markdown 格式，保持原模板的标题层级不变。
+"""
+
+        # 2. 优先使用实例属性（如果 endpoints.py 传了值就用传的，没传就用默认的 0.3）
+        actual_temp = getattr(self, 'temperature', temperature)
+        actual_tokens = getattr(self, 'max_tokens', max_tokens)
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                max_tokens=max_tokens
+                messages=[
+                    {"role": "system", "content": system_instruction}, # 👈 救命的系统提示词
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=actual_temp,
+                max_tokens=actual_tokens
             )
             
             content = response.choices[0].message.content
             
-            # 清理思考过程
+            # 清理思考过程 (针对 DeepSeek-R1 等带有 <think> 的模型)
             content = remove_thinking_tags(content)
-            
             # 添加高亮标记
             content = add_highlighting(content)
-            
-            logger.info(f"✅ LLM 生成完成，长度: {len(content)}")
+
+            usage = getattr(response, "usage", None)
+            if usage:
+                total_tokens = getattr(usage, "total_tokens", 0) or 0
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                self.last_usage = {
+                    "total_tokens": int(total_tokens),
+                    "prompt_tokens": int(prompt_tokens),
+                    "completion_tokens": int(completion_tokens),
+                }
+                logger.info(
+                    f"✅ LLM 生成完成，长度: {len(content)}，Token 使用：输入={prompt_tokens}，输出={completion_tokens}，总计={total_tokens}，温度={actual_temp}"
+                )
+            else:
+                self.last_usage = None
+                logger.info(f"✅ LLM 生成完成，长度: {len(content)}（未返回 Token 使用信息）")
+
             return content
             
         except Exception as e:
-            logger.error(f"❌ LLM Chat 调用失败: {e}")
-            raise
+            error_msg = str(e)
+            # 提供更友好的错误提示
+            if "Authentication" in error_msg or "governor" in error_msg:
+                if not self.api_key or self.api_key == "":
+                    logger.error("❌ LLM API Key 未配置！请在 .env 文件或 docker-compose.yml 中设置 LLM_API_KEY")
+                    raise ValueError("LLM API Key 未配置。请检查环境变量 LLM_API_KEY 是否正确传递到容器内。")
+                else:
+                    logger.error(f"❌ LLM 认证失败: {error_msg}")
+                    logger.error("💡 可能的原因：")
+                    logger.error("   1. API Key 已过期或无效")
+                    logger.error("   2. API Key 格式错误（应包含 'sk-' 前缀）")
+                    logger.error("   3. 账号被限制或禁用")
+                    logger.error("   4. 余额不足或达到调用限制")
+                    raise ValueError(f"LLM 认证失败: {error_msg}。请检查 API Key 是否正确且有效。")
+            elif "rate limit" in error_msg.lower() or "429" in error_msg:
+                logger.error(f"❌ LLM 调用频率限制: {error_msg}")
+                logger.error("💡 建议：降低请求频率或检查账号配额")
+                raise
+            else:
+                logger.error(f"❌ LLM Chat 调用失败: {error_msg}")
+                raise
 
 llm_service = LLMService()

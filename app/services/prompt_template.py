@@ -7,7 +7,7 @@ from jinja2 import Template, TemplateError
 import json
 import os
 from pathlib import Path
-
+import uuid
 from app.core.logger import logger
 from app.prompts.templates import get_default_template
 
@@ -176,6 +176,7 @@ class PromptTemplateService:
                     "current_transcript": current_transcript,
                     "history_section": history_section,
                     "requirement_section": requirement_section,
+                    "user_requirement": user_requirement or "",  # 添加 user_requirement 变量，用于 smart_prompt
                     "mapping_section": mapping_section,
                     "reference_document_section": reference_document_section,  # 新增：参考文档部分
                     **kwargs  # 其他自定义变量（包括 reference_document）
@@ -183,12 +184,29 @@ class PromptTemplateService:
                 
                 final_prompt = main_template.render(**render_vars)
                 
+                # 调试：检查录音内容是否被正确传递
+                transcript_length = len(current_transcript) if current_transcript else 0
                 logger.info(
                     f"✅ 模板渲染成功 "
                     f"(历史: {'✓' if history_section else '✗'}, "
                     f"需求: {'✓' if requirement_section else '✗'}, "
-                    f"参考文档: {'✓' if reference_document_section else '✗'})"
+                    f"参考文档: {'✓' if reference_document_section else '✗'}, "
+                    f"录音内容长度: {transcript_length} 字符)"
                 )
+                
+                # 调试：检查最终 prompt 中是否包含录音内容
+                if transcript_length > 0:
+                    # 检查是否包含 current_transcript 变量（可能是 {{current_transcript}} 或已渲染的内容）
+                    if "{{current_transcript}}" in final_prompt:
+                        logger.error(f"❌ 错误：最终 prompt 中包含未渲染的变量 {{current_transcript}}！模板渲染可能失败！")
+                    elif current_transcript[:100] not in final_prompt:
+                        logger.warning(f"⚠️ 警告：最终 prompt 中可能未包含录音内容！")
+                        logger.warning(f"   录音内容前100字符: {current_transcript[:100]}")
+                        logger.warning(f"   最终 prompt 前500字符: {final_prompt[:500]}")
+                    else:
+                        logger.info(f"✅ 确认：最终 prompt 中包含录音内容（前100字符匹配）")
+                else:
+                    logger.warning("⚠️ 警告：录音内容为空！")
                 
                 return final_prompt
                 
@@ -367,7 +385,7 @@ class PromptTemplateService:
                     from app.services.document import document_service
 
                     logger.info(f"🔗 检测到自定义模板URL: {cleaned}")
-                    resp = requests.get(cleaned, timeout=15)
+                    resp = requests.get(cleaned, timeout=25)
                     resp.raise_for_status()
 
                     # 根据URL后缀或Content-Type判断是否按文档处理
@@ -434,22 +452,30 @@ class PromptTemplateService:
                 if os.path.exists(cleaned):
                     try:
                         from app.services.document import document_service
-                        template_content = document_service.extract_text_from_file(cleaned)
+                        # ⭐ 使用 extract_html_from_file 保持原模板格式（HTML5）
+                        template_html = document_service.extract_html_from_file(cleaned)
                         
-                        if template_content and template_content.strip():
-                            logger.info(f"✅ 成功读取模板文档，长度: {len(template_content)}")
+                        if template_html and template_html.strip():
+                            logger.info(f"✅ 成功读取模板文档（HTML格式），长度: {len(template_html)}")
+                            
+                            # 从 HTML 中提取纯文本用于检测占位符
+                            import re
+                            # 移除 HTML 标签，保留文本内容
+                            template_text = re.sub(r'<[^>]+>', '', template_html)
                             
                             # ⭐ 智能检测：是否包含占位符（说明是格式模板而非提示词）
                             is_format_template = any([
-                                '[请填写' in template_content,
-                                '[例如：' in template_content,
-                                'XXXX' in template_content,
-                                '[填写' in template_content,
-                                '【请填写' in template_content,
+                                '[请填写' in template_text,
+                                '[例如：' in template_text,
+                                'XXXX' in template_text,
+                                '[填写' in template_text,
+                                '【请填写' in template_text,
+                                '待补充' in template_text,
+                                '待填写' in template_text,
                             ])
                             
                             if is_format_template:
-                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求")
+                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求，使用原HTML格式")
                                 # 构建一个智能提示词，让 LLM 根据转录内容填充模板
                                 smart_prompt = f"""你是一位专业的会议纪要整理助手。
 
@@ -461,29 +487,44 @@ class PromptTemplateService:
 2. **如果用户要求与格式模板冲突，完全以用户要求为准，忽略模板的相应部分**
 3. **用户要求什么就生成什么，用户不要什么就完全省略什么**
 
+## 🚨🚨🚨 【核心要求 - 严格基于录音内容】🚨🚨🚨
+**绝对禁止添加录音中没有的内容！**
+1. **所有内容必须严格来源于下方的【会议录音转录内容】**
+2. **如果录音中没有提到某项内容，必须填写"未讨论"或"无"，绝不能编造或推测**
+3. **禁止基于常识、历史会议或参考文档来补充录音中没有的内容**
+4. **如果模板要求的内容在录音中完全不存在，直接填写"未讨论"，不要保留占位符**
+5. **参考文档和历史会议仅用于理解上下文，不能作为生成内容的依据**
+
 ## 任务说明
-请根据以下**会议录音转录内容**，参考**格式模板**生成会议纪要。
+请根据以下**会议录音转录内容**，严格按照**格式模板**的结构和格式生成会议纪要。
 
-## 格式模板（仅作参考，如与用户要求冲突则完全以用户要求为准）
-{template_content}
+## 格式模板（必须严格保持原格式，包括标题、段落结构、标点符号等）
+{template_html}
 
-## 会议录音转录内容
+## 会议录音转录内容（这是唯一的内容来源）
 {{{{current_transcript}}}}
 
-## 历史会议背景（如有）
-{{{{history_context}}}}
+## 历史会议背景（仅用于理解上下文，不能作为生成内容的依据）
+{{{{history_section}}}}
+
+## 参考文档（仅用于理解上下文，不能作为生成内容的依据）
+{{{{reference_document_section}}}}
 
 ## 基本要求
-1. **必须根据实际会议内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`）
-2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容**
-3. 如果会议中没有提及某项内容，填写"未讨论"或"无"
-4. 人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记
-5. 存疑内容使用 `<mark class="uncertain">` 标记
+1. **必须严格根据录音转录内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`、`待补充`等）
+2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容或"未讨论"**
+3. **如果录音中没有提及模板要求的某项内容，必须填写"未讨论"或"无"，绝不能编造**
+4. **模板中的Markdown标题(#、##)和所有标点、序号必须100%原样保留**
+5. **人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记**
+6. **存疑内容使用 `<mark class="uncertain">` 标记**
 
 ## 🔥 最后检查（生成前必须确认）
 ✅ 是否100%严格遵守了用户要求？
+✅ 是否所有内容都来源于录音转录内容？
+✅ 是否没有添加任何录音中没有的内容？
 ✅ 如果用户要求与模板冲突，是否以用户要求为准？
-✅ 是否用实际内容替换了所有占位符？
+✅ 是否用实际内容或"未讨论"替换了所有占位符？
+✅ 是否保持了模板的原始格式（标题、段落、标点等）？
 
 请立即生成会议纪要！"""
                                 
@@ -495,12 +536,12 @@ class PromptTemplateService:
                                     "dynamic_sections": {}
                                 }
                             else:
-                                logger.info("📝 检测到提示词模板（无占位符），直接使用")
+                                logger.info("📝 检测到提示词模板（无占位符），直接使用HTML格式")
                                 # 直接作为提示词使用
                                 return {
                                     "template_id": "custom_from_doc",
                                     "template_name": f"文档模板: {os.path.basename(cleaned)}",
-                                    "prompt_template": template_content,
+                                    "prompt_template": template_html,
                                     "variables": {},
                                     "dynamic_sections": {}
                                 }
@@ -578,7 +619,8 @@ class PromptTemplateService:
                         with open(tmp_path, "wb") as f:
                             f.write(resp.content)
                         try:
-                            template_content = document_service.extract_text_from_file(
+                            # ⭐ 使用 extract_html_from_file 保持原模板格式（HTML5）
+                            template_content = document_service.extract_html_from_file(
                                 tmp_path
                             )
                         finally:
@@ -593,13 +635,133 @@ class PromptTemplateService:
                         logger.info(
                             f"✅ 成功从URL加载 template_id 模板内容，长度: {len(template_content)}"
                         )
-                        return {
-                            "template_id": "custom_from_url",
-                            "template_name": f"URL模板: {cleaned_tid}",
-                            "prompt_template": template_content,
-                            "variables": {},
-                            "dynamic_sections": {},
-                        }
+                        
+                        # ⭐ 检测是否是格式模板（包含占位符）
+                        import re
+                        if is_doc:
+                            # 从 HTML 中提取纯文本用于检测占位符
+                            template_text = re.sub(r'<[^>]+>', '', template_content)
+                        else:
+                            template_text = template_content
+                        
+                        # 使用更稳健的占位符检测逻辑，减少误判：
+                        # 只有在出现多个典型占位符时，才认为是“格式模板”，否则当作普通参考文档处理。
+                        placeholder_patterns = [
+                            '[请填写',
+                            '[例如：',
+                            'XXXX',
+                            '[填写',
+                            '【请填写',
+                            '待补充',
+                            '待填写',
+                        ]
+                        hit_count = sum(1 for p in placeholder_patterns if p in template_text)
+                        is_format_template = hit_count >= 2
+                        
+                        if is_format_template and is_doc:
+                            logger.info("🎯 检测到URL格式模板（包含占位符），将作为输出格式要求，使用原HTML格式")
+                            # 构建一个智能提示词，让 LLM 根据转录内容填充“带占位符”的格式模板
+                            smart_prompt = f"""你是一位专业的会议纪要整理助手。
+
+## 🚨🚨🚨 【第一优先级 - 用户要求】必须100%严格遵守！
+{{{{user_requirement}}}}
+
+⚠️⚠️⚠️ **铁律**：
+1. **用户的任何要求都必须无条件执行，优先级高于一切（包括格式模板、标准规范等）**
+2. **如果用户要求与格式模板冲突，完全以用户要求为准，忽略模板的相应部分**
+3. **用户要求什么就生成什么，用户不要什么就完全省略什么**
+
+## 🚨🚨🚨 【核心要求 - 严格基于录音内容】🚨🚨🚨
+**绝对禁止添加录音中没有的内容！**
+1. **所有内容必须严格来源于下方的【会议录音转录内容】**
+2. **如果录音中没有提到某项内容，必须填写"未讨论"或"无"，绝不能编造或推测**
+3. **禁止基于常识、历史会议或参考文档来补充录音中没有的内容**
+4. **如果模板要求的内容在录音中完全不存在，直接填写"未讨论"，不要保留占位符**
+5. **参考文档和历史会议仅用于理解上下文，不能作为生成内容的依据**
+
+## 任务说明
+请根据以下**会议录音转录内容**，严格按照**格式模板**的结构和格式生成会议纪要。
+
+## 格式模板（必须严格保持原格式，包括标题、段落结构、标点符号等）
+{template_content}
+
+## 会议录音转录内容（这是唯一的内容来源）
+{{{{current_transcript}}}}
+
+## 历史会议背景（仅用于理解上下文，不能作为生成内容的依据）
+{{{{history_section}}}}
+
+## 参考文档（仅用于理解上下文，不能作为生成内容的依据）
+{{{{reference_document_section}}}}
+
+## 基本要求
+1. **必须严格根据录音转录内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`、`待补充`等）
+2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容或"未讨论"**
+3. **如果录音中没有提及模板要求的某项内容，必须填写"未讨论"或"无"，绝不能编造**
+4. **模板中的Markdown标题(#、##)和所有标点、序号必须100%原样保留**
+5. **人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记**
+6. **存疑内容使用 `<mark class="uncertain">` 标记**
+
+## 🔥 最后检查（生成前必须确认）
+✅ 是否100%严格遵守了用户要求？
+✅ 是否所有内容都来源于录音转录内容？
+✅ 是否没有添加任何录音中没有的内容？
+✅ 如果用户要求与模板冲突，是否以用户要求为准？
+✅ 是否用实际内容或"未讨论"替换了所有占位符？
+✅ 是否保持了模板的原始格式（标题、段落、标点等）？
+
+请立即生成会议纪要！"""
+                            
+                            return {
+                                "template_id": "custom_format_template_url",
+                                "template_name": f"URL格式模板: {os.path.basename(url_path)}",
+                                "prompt_template": smart_prompt,
+                                "variables": {},
+                                "dynamic_sections": {}
+                            }
+                        else:
+                            # ⭐ 无占位符的 URL 模板：将其视为“格式参考模板”，用实际会议内容填充，不照抄示例文字
+                            logger.info("📝 检测到URL提示词/格式模板（无占位符），将作为格式参考使用，并基于转录内容进行填充")
+                            smart_prompt = f"""你是一位专业的会议纪要整理助手。
+
+## 🚨🚨🚨 【第一优先级 - 用户要求】必须100%严格遵守！
+{{{{user_requirement}}}}
+
+⚠️⚠️⚠️ **核心原则：内容优先，格式从模板学习**
+1. 下方给出了一份 HTML 格式的“会议纪要模板示例”，**只用于学习其版式结构、段落顺序、层级关系和字段名称**。
+2. 模板中的示例文字（如“XXXX年XX月XX日”、“某某项目”等）**一律视为占位示例，绝对禁止照抄或当作真实内容输出**。
+3. 你必须完全基于【会议内容】（录音转写 / 文本）来填充每个部分，**不得编造录音/文本中不存在的事实**。
+4. 如果模板中的某个栏目在会议内容中完全未提及，请在对应位置自然说明“本次会议未明确讨论该项内容”或“暂无相关信息”，而不是留下占位符。
+
+## 输出格式模板示例（仅作版式参考，示例文字不得照抄）
+以下 HTML 仅用于说明“应该采用怎样的标题层级和段落结构”，其中的具体文字内容全部是示例：
+
+{template_content}
+
+## 会议内容（这是唯一的信息来源，可以来自录音转写、rebuild 或 text_content）
+请严格基于下方内容，提炼出会议纪要并填入上述格式结构中：
+
+{{{{current_transcript}}}}
+
+## 历史会议背景（仅用于理解上下文，不能作为生成内容的唯一依据）
+{{{{history_section}}}}
+
+## 参考文档（仅用于理解上下文，不能作为生成内容的唯一依据）
+{{{{reference_document_section}}}}
+
+## 输出要求
+1. 输出格式必须保持与“输出格式模板示例”的整体结构一致（标题层级、主要栏目名称）。
+2. 所有内容必须能够在【会议内容】或参考信息中找到依据，禁止凭空捏造。
+3. 对于未在会议中明确讨论的部分，请自然说明“本次会议未明确讨论该项内容”或“暂无相关信息”，不要使用“录音未明确”等表述。
+4. 输出内容直接使用 HTML5 格式（支持 <p>、<h1>-<h3>、<ul>/<ol>、<li> 等），不要再包含占位符。"""
+
+                            return {
+                                "template_id": "custom_format_template_url_plain",
+                                "template_name": f"URL格式参考模板: {cleaned_tid}",
+                                "prompt_template": smart_prompt,
+                                "variables": {},
+                                "dynamic_sections": {}
+                            }
                     else:
                         logger.error("❌ template_id URL 模板内容为空")
                 except Exception as e:
@@ -613,22 +775,30 @@ class PromptTemplateService:
                 if os.path.exists(cleaned_tid):
                     try:
                         from app.services.document import document_service
-                        template_content = document_service.extract_text_from_file(cleaned_tid)
+                        # ⭐ 使用 extract_html_from_file 保持原模板格式（HTML5）
+                        template_html = document_service.extract_html_from_file(cleaned_tid)
                         
-                        if template_content and template_content.strip():
-                            logger.info(f"✅ 成功读取模板文档，长度: {len(template_content)}")
+                        if template_html and template_html.strip():
+                            logger.info(f"✅ 成功读取模板文档（HTML格式），长度: {len(template_html)}")
+                            
+                            # 从 HTML 中提取纯文本用于检测占位符
+                            import re
+                            # 移除 HTML 标签，保留文本内容
+                            template_text = re.sub(r'<[^>]+>', '', template_html)
                             
                             # ⭐ 智能检测：是否包含占位符（说明是格式模板而非提示词）
                             is_format_template = any([
-                                '[请填写' in template_content,
-                                '[例如：' in template_content,
-                                'XXXX' in template_content,
-                                '[填写' in template_content,
-                                '【请填写' in template_content,
+                                '[请填写' in template_text,
+                                '[例如：' in template_text,
+                                'XXXX' in template_text,
+                                '[填写' in template_text,
+                                '【请填写' in template_text,
+                                '待补充' in template_text,
+                                '待填写' in template_text,
                             ])
                             
                             if is_format_template:
-                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求")
+                                logger.info("🎯 检测到格式模板（包含占位符），将作为输出格式要求，使用原HTML格式")
                                 # 构建一个智能提示词，让 LLM 根据转录内容填充模板
                                 smart_prompt = f"""你是一位专业的会议纪要整理助手。
 
@@ -640,29 +810,44 @@ class PromptTemplateService:
 2. **如果用户要求与格式模板冲突，完全以用户要求为准，忽略模板的相应部分**
 3. **用户要求什么就生成什么，用户不要什么就完全省略什么**
 
+## 🚨🚨🚨 【核心要求 - 严格基于录音内容】🚨🚨🚨
+**绝对禁止添加录音中没有的内容！**
+1. **所有内容必须严格来源于下方的【会议录音转录内容】**
+2. **如果录音中没有提到某项内容，必须填写"未讨论"或"无"，绝不能编造或推测**
+3. **禁止基于常识、历史会议或参考文档来补充录音中没有的内容**
+4. **如果模板要求的内容在录音中完全不存在，直接填写"未讨论"，不要保留占位符**
+5. **参考文档和历史会议仅用于理解上下文，不能作为生成内容的依据**
+
 ## 任务说明
-请根据以下**会议录音转录内容**，参考**格式模板**生成会议纪要。
+请根据以下**会议录音转录内容**，严格按照**格式模板**的结构和格式生成会议纪要。
 
-## 格式模板（仅作参考，如与用户要求冲突则完全以用户要求为准）
-{template_content}
+## 格式模板（必须严格保持原格式，包括标题、段落结构、标点符号等）
+{template_html}
 
-## 会议录音转录内容
+## 会议录音转录内容（这是唯一的内容来源）
 {{{{current_transcript}}}}
 
-## 历史会议背景（如有）
-{{{{history_context}}}}
+## 历史会议背景（仅用于理解上下文，不能作为生成内容的依据）
+{{{{history_section}}}}
+
+## 参考文档（仅用于理解上下文，不能作为生成内容的依据）
+{{{{reference_document_section}}}}
 
 ## 基本要求
-1. **必须根据实际会议内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`）
-2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容**
-3. 如果会议中没有提及某项内容，填写"未讨论"或"无"
-4. 人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记
-5. 存疑内容使用 `<mark class="uncertain">` 标记
+1. **必须严格根据录音转录内容填充**，不要保留任何占位符（如 `[请填写...]`、`XXXX`、`[例如：...]`、`待补充`等）
+2. **所有方括号 `[]` 内的内容都是提示，必须替换为实际内容或"未讨论"**
+3. **如果录音中没有提及模板要求的某项内容，必须填写"未讨论"或"无"，绝不能编造**
+4. **模板中的Markdown标题(#、##)和所有标点、序号必须100%原样保留**
+5. **人名、项目名使用 `<mark class="person">` 和 `<mark class="project">` 标记**
+6. **存疑内容使用 `<mark class="uncertain">` 标记**
 
 ## 🔥 最后检查（生成前必须确认）
 ✅ 是否100%严格遵守了用户要求？
+✅ 是否所有内容都来源于录音转录内容？
+✅ 是否没有添加任何录音中没有的内容？
 ✅ 如果用户要求与模板冲突，是否以用户要求为准？
-✅ 是否用实际内容替换了所有占位符？
+✅ 是否用实际内容或"未讨论"替换了所有占位符？
+✅ 是否保持了模板的原始格式（标题、段落、标点等）？
 
 请立即生成会议纪要！"""
                                 
@@ -674,11 +859,45 @@ class PromptTemplateService:
                                     "dynamic_sections": {}
                                 }
                             else:
-                                logger.info("📝 检测到提示词模板（无占位符），直接使用")
+                                # 无占位符的本地文档模板：同样作为“格式参考”，基于会议内容填充
+                                logger.info("📝 检测到文档提示词/格式模板（无占位符），将作为格式参考使用，并基于转录内容进行填充")
+                                smart_prompt = f"""你是一位专业的会议纪要整理助手。
+
+## 🚨🚨🚨 【第一优先级 - 用户要求】必须100%严格遵守！
+{{{{user_requirement}}}}
+
+⚠️⚠️⚠️ **核心原则：内容优先，格式从模板学习**
+1. 下方给出了一份 HTML 格式的“会议纪要模板示例”，**只用于学习其版式结构、段落顺序、层级关系和字段名称**。
+2. 模板中的示例文字（如“XXXX年XX月XX日”、“某某项目”等）**一律视为占位示例，绝对禁止照抄或当作真实内容输出**。
+3. 你必须完全基于【会议内容】（录音转写 / 文本）来填充每个部分，**不得编造录音/文本中不存在的事实**。
+4. 如果模板中的某个栏目在会议内容中完全未提及，请在对应位置自然说明“本次会议未明确讨论该项内容”或“暂无相关信息”，而不是留下占位符。
+
+## 输出格式模板示例（仅作版式参考，示例文字不得照抄）
+以下 HTML 仅用于说明“应该采用怎样的标题层级和段落结构”，其中的具体文字内容全部是示例：
+
+{template_html}
+
+## 会议内容（这是唯一的信息来源，可以来自录音转写、rebuild 或 text_content）
+请严格基于下方内容，提炼出会议纪要并填入上述格式结构中：
+
+{{{{current_transcript}}}}
+
+## 历史会议背景（仅用于理解上下文，不能作为生成内容的唯一依据）
+{{{{history_section}}}}
+
+## 参考文档（仅用于理解上下文，不能作为生成内容的唯一依据）
+{{{{reference_document_section}}}}
+
+## 输出要求
+1. 输出格式必须保持与“输出格式模板示例”的整体结构一致（标题层级、主要栏目名称）。
+2. 所有内容必须能够在【会议内容】或参考信息中找到依据，禁止凭空捏造。
+3. 对于未在会议中明确讨论的部分，请自然说明“本次会议未明确讨论该项内容”或“暂无相关信息”，不要使用“录音未明确”等表述。
+4. 输出内容直接使用 HTML5 格式（支持 <p>、<h1>-<h3>、<ul>/<ol>、<li> 等），不要再包含占位符。"""
+
                                 return {
-                                    "template_id": "custom_from_doc",
-                                    "template_name": f"文档模板: {os.path.basename(cleaned_tid)}",
-                                    "prompt_template": template_content,
+                                    "template_id": "custom_from_doc_format_ref",
+                                    "template_name": f"文档格式参考模板: {os.path.basename(cleaned_tid)}",
+                                    "prompt_template": smart_prompt,
                                     "variables": {},
                                     "dynamic_sections": {}
                                 }

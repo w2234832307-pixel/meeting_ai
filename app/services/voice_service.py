@@ -455,6 +455,25 @@ class VoiceService:
             logger.error(f"❌ 声纹入库失败: {e}")
             raise e
     
+    def delete_identity(self, employee_id: str) -> bool:
+        """
+        从 Chroma 声纹库中删除某个员工的声纹记录。
+        
+        Args:
+            employee_id: 员工工号（作为 Chroma 的 id 使用）
+        
+        Returns:
+            True 删除成功 / False 删除失败（具体错误可查看日志）
+        """
+        emp_id_str = str(employee_id)
+        try:
+            self.collection.delete(ids=[emp_id_str])
+            logger.info(f"🗑️ 已从声纹库删除员工声纹: {emp_id_str}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 删除声纹失败 (employee_id={emp_id_str}): {e}")
+            return False
+    
     @property
     def enabled(self) -> bool:
         """检查声纹服务是否启用（声纹库是否为空）"""
@@ -488,10 +507,27 @@ class VoiceService:
         speaker_times = {}  # {speaker_id: [(start, end), ...]}
         
         # 1. 收集每个说话人的所有时间段
+        #    注意：外部 transcript 目前使用的是毫秒时间戳(start_time/end_time 为 ms)，
+        #    这里需要统一转换为「秒」再参与后续采样点计算。
         for item in transcript:
             speaker_id = item.get("speaker_id", "unknown")
-            start_time = item.get("start_time", 0)
-            end_time = item.get("end_time", 0)
+            start_raw = item.get("start_time", 0)
+            end_raw = item.get("end_time", 0)
+
+            # 兼容旧版（秒）与新版（毫秒）：
+            # - 如果值大于 1000，认为是毫秒；否则认为是秒。
+            try:
+                start_val = float(start_raw)
+                end_val = float(end_raw)
+            except (TypeError, ValueError):
+                start_val, end_val = 0.0, 0.0
+
+            if start_val > 1000 or end_val > 1000:
+                start_time = start_val / 1000.0
+                end_time = end_val / 1000.0
+            else:
+                start_time = start_val
+                end_time = end_val
             
             if speaker_id not in speaker_times:
                 speaker_times[speaker_id] = []
@@ -787,8 +823,7 @@ class VoiceService:
             if speaker_id in matched:
                 employee_id, name, similarity = matched[speaker_id]
                 item['speaker_id'] = name
-                item['employee_id'] = employee_id
-                item['similarity'] = similarity
+                # 不添加 employee_id 和 similarity 到 transcript_item 中
         
         return transcript
 

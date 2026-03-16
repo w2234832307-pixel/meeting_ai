@@ -149,186 +149,212 @@ class DocumentService:
             return None
 
     def extract_html_from_docx(self, file_path: str):
-        from docx import Document
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        """
+        通用的 .docx -> HTML5 转换：
+        - 段落：对齐、字号、颜色、粗体、斜体、下划线
+        - 标题：根据段落样式名（Heading 1/2/3...）映射为 <h1>/<h2>/<h3>
+        - 列表：支持有序/无序列表（基于段落样式名推断）
+        - 表格：输出 <table><tr><td>...</td></tr></table>
         
+        注意：不会依赖某个具体模板的内容，所有逻辑基于通用的 Word 结构信息。
+        """
+        from docx import Document
+        from docx.enum.text import WD_UNDERLINE
+
         try:
             doc = Document(file_path)
-            html_paragraphs = []
+            html_parts = []
 
-            for p in doc.paragraphs:
-                # 1. 第一步：地毯式搜索属性 (之前的逻辑)
-                alignment = p.alignment
-                if alignment is None:
-                    alignment = p.paragraph_format.alignment
-                if alignment is None and p.style:
-                    curr_style = p.style
-                    while curr_style:
-                        if curr_style.paragraph_format.alignment is not None:
-                            alignment = curr_style.paragraph_format.alignment
-                            break
-                        curr_style = getattr(curr_style, 'base_style', None)
+            # 1. 先处理表格（保持顺序：段落和表格在 doc._body._element 中混合比较复杂，这里简化为“先段落后表格”）
+            #   如果将来有强需求，可以按 document._body._element 遍历以完全还原顺序。
 
-                # 2. 第二步：语义兜底 (解决读不到属性的顽固文件)
-                # 逻辑：如果字号 > 20pt (大概 26px 以上)，通常就是标题，强制居中
-                is_large_font = False
-                for run in p.runs:
-                    # 增加 run.font.size 是否存在的检查
-                    if run.font and run.font.size and run.font.size.pt:
-                        if run.font.size.pt > 20:
-                            is_large_font = True
-                            break
+            # 1.1 处理普通段落（含标题/列表）
+            html_parts.append(self._convert_paragraphs_to_html(doc.paragraphs))
 
-                # 3. 确定最终 Class
-                align_class = ""
-                if alignment == 1 or is_large_font: # 1 是居中，或者字号超大
-                    align_class = "center"
-                elif alignment == 2:
-                    align_class = "right"
-                
-                # --- 调试：如果还是抓不到，你可以加一行打印看看 ---
-                # print(f"Text: {p.text[:10]}... | Alignment Found: {alignment}")
+            # 1.2 处理表格
+            if doc.tables:
+                for table in doc.tables:
+                    html_parts.append(self._convert_table_to_html(table))
 
-                # --- 3. 处理红头横线逻辑 (保持不变) ---
-                line_style = ""
-                if "编号" in p.text or "签发人" in p.text:
-                    line_style = "border-bottom: 2px solid black; padding-bottom: 5px; margin-bottom: 15px;"
-
-                # --- 4. 处理 Runs (文字、颜色、字号) ---
-                runs_html = ""
-                for run in p.runs:
-                    font_css = []
-                    if run.font.size:
-                        # Word 字号转 px
-                        font_css.append(f"font-size: {run.font.size.pt * 1.3}px")
-                    if run.font.color and run.font.color.rgb:
-                        font_css.append(f"color: #{run.font.color.rgb}")
-                    
-                    style_str = "; ".join(font_css)
-                    content = run.text.replace(" ", "&nbsp;") # 保留空格
-                    
-                    inner_html = f'<span style="{style_str}">{content}</span>'
-                    if run.bold:
-                        inner_html = f"<strong>{inner_html}</strong>"
-                    
-                    runs_html += inner_html
-
-                # --- 5. 组装段落标签 ---
-                if runs_html.strip() or p.runs:
-                    # 确保 class="{align_class}" 始终存在
-                    html_paragraphs.append(
-                        f'<p class="{align_class}" style="{line_style}">{runs_html}</p>'
-                    )
-
-            # --- 6. 修改这里：确保 CSS 定义严谨 ---
-            full_html = f"""
-            <!DOCTYPE html><html><head><meta charset="utf-8">
-            <style>
-                body {{ font-family: "SimSun", serif; padding: 40px; max-width: 800px; margin: 0 auto; background: #fff; }}
-                /* 必须设置 width: 100% 居中才能生效 */
-                p {{ 
-                    margin: 0.8em 0; 
-                    width: 100%; 
-                    min-height: 1.2em; 
-                    line-height: 1.6;
-                    text-align: left; /* 默认左对齐 */
-                }}
-                .center {{ text-align: center !important; }}
-                .right {{ text-align: right !important; }}
-                strong {{ font-weight: bold; }}
-            </style></head>
-            <body>{"".join(html_paragraphs)}</body></html>
-            """
-            return full_html
+            return "".join(html_parts)
 
         except Exception as e:
             import traceback
             return f"解析异常: {str(e)}\n{traceback.format_exc()}"
 
+    # ============================
+    # 内部辅助方法：段落 / 列表 / 表格
+    # ============================
 
-    # def extract_html_from_docx(self, file_path):
-    #     doc = Document(file_path)
-    #     html_paragraphs = []
+    def _convert_paragraphs_to_html(self, paragraphs):
+        """将段落列表转换为 HTML，支持标题、列表、普通段落。"""
+        html_parts = []
+        i = 0
+        n = len(paragraphs)
 
-    #     for p in doc.paragraphs:
-    #         # --- 1. 处理对齐 ---
-    #         alignment = p.alignment
-        
-    #         # 2. 如果显式设置是 None，则去样式（Style）里寻找
-    #         if alignment is None:
-    #             # 向上追溯样式的对齐方式
-    #             current_style = p.style
-    #             while current_style is not None:
-    #                 if current_style.paragraph_format.alignment is not None:
-    #                     alignment = current_style.paragraph_format.alignment
-    #                     break
-    #                 current_style = current_style.base_style  # 继续往父类样式找
-            
-    #         # 3. 翻译为 HTML 类名 (1=CENTER, 2=RIGHT)
-    #         align_class = ""
-    #         if alignment == 1:
-    #             align_class = "center"
-    #         elif alignment == 2:
-    #             align_class = "right"
+        while i < n:
+            p = paragraphs[i]
+            text = p.text or ""
+            style_name = (p.style.name or "").lower() if p.style else ""
 
-    #         # --- 2. 处理横线 (红头文件逻辑) ---
-    #         # 如果这一行包含 "编号" 且下方有横线样式
-    #         extra_style = ""
-    #         if "编号：" in p.text or "【20" in p.text:
-    #             extra_style = " border-bottom: 2px solid black; padding-bottom: 10px; margin-bottom: 20px;"
+            # 1. 检测列表段落（基于样式名）
+            is_bullet = any(k in style_name for k in ["bullet", "list bullet", "项目符号"])
+            is_number = any(k in style_name for k in ["number", "list number", "编号"])
 
-    #         runs_html = ""
-    #         for run in p.runs:
-    #             text = run.text.replace(" ", "&nbsp;") # 保留空格
-                
-    #             # --- 3. 处理字号与颜色 ---
-    #             font_style = []
-    #             if run.font.size:
-    #                 # Word字号转px: pt * 1.33
-    #                 font_style.append(f"font-size: {run.font.size.pt * 1.33:.1f}px")
-    #             if run.font.color and run.font.color.rgb:
-    #                 font_style.append(f"color: #{run.font.color.rgb}")
-                
-    #             style_str = "; ".join(font_style)
-    #             span_html = f'<span style="{style_str}">{text}</span>'
-                
-    #             # 处理加粗
-    #             if run.bold:
-    #                 span_html = f"<strong>{span_html}</strong>"
-                
-    #             runs_html += span_html
+            if (is_bullet or is_number) and text.strip():
+                # 聚合连续的列表段落
+                list_items = []
+                list_type = "ul" if is_bullet else "ol"
 
-    #         # --- 4. 组装标签 ---
-    #         tag = "p"
-    #         if p.style.name.startswith('Heading'):
-    #             tag = f"h{p.style.name[-1]}"
-                
-    #         if runs_html.strip() or "&nbsp;" in runs_html:
-    #             html_paragraphs.append(
-    #                 f'<{tag} class="{align_class}" style="{extra_style}">{runs_html}</{tag}>'
-    #             )
+                while i < n:
+                    p2 = paragraphs[i]
+                    style2 = (p2.style.name or "").lower() if p2.style else ""
+                    is_bullet2 = any(k in style2 for k in ["bullet", "list bullet", "项目符号"])
+                    is_number2 = any(k in style2 for k in ["number", "list number", "编号"])
+                    if not (is_bullet2 or is_number2):
+                        break
+                    if (p2.text or "").strip():
+                        item_html = self._convert_single_paragraph_runs_to_html(p2)
+                        list_items.append(f"<li>{item_html}</li>")
+                    i += 1
 
-    #     # 5. 最终 CSS 补全
-    #     full_html = f"""
-    #     <html><head><style>
-    #         body {{ font-family: "SimSun", serif; padding: 50px; line-height: 1.5; background-color: #f5f5f5; }}
-    #         /* 核心：确保段落作为块级元素宽度占满，否则内部居中无效 */
-    #         p {{ 
-    #             margin: 10px 0; 
-    #             width: 100%; 
-    #             min-height: 1em;
-    #             white-space: pre-wrap; /* 保留空格 */
-    #         }}
-    #         /* 居中和右对齐强制生效 */
-    #         .center {{ text-align: center !important; }}
-    #         .right {{ text-align: right !important; }}
-            
-    #         h1, h2 {{ font-weight: bold; text-align: center; }}
-    #         strong {{ font-weight: bold; }}
-    #     </style></head>
-    #     <body>{"".join(html_paragraphs)}</body></html>
-    #     """
-    #     return full_html
+                if list_items:
+                    html_parts.append(f"<{list_type}>" + "".join(list_items) + f"</{list_type}>")
+                continue  # continue while
+
+            # 2. 非列表：判断是否为标题
+            heading_level = None
+            if style_name.startswith("heading"):
+                # e.g. "Heading 1" -> 1
+                parts = style_name.split()
+                for p_token in parts:
+                    if p_token.isdigit():
+                        heading_level = int(p_token)
+                        break
+
+            # 3. 普通段落/标题
+            runs_html, align_class, inline_style = self._convert_paragraph_style_and_runs(p)
+
+            if runs_html.strip():
+                if heading_level and 1 <= heading_level <= 6:
+                    tag = f"h{heading_level}"
+                else:
+                    tag = "p"
+
+                class_attr = f' class="{align_class}"' if align_class else ""
+                style_attr = f' style="{inline_style}"' if inline_style else ""
+                html_parts.append(f"<{tag}{class_attr}{style_attr}>{runs_html}</{tag}>")
+
+            i += 1
+
+        return "".join(html_parts)
+
+    def _convert_paragraph_style_and_runs(self, p):
+        """将单个段落的对齐 / 红头线 / run 样式转换为 HTML 片段。"""
+        # 1. 对齐检测（与原逻辑一致）
+        alignment = p.alignment
+        if alignment is None:
+            alignment = p.paragraph_format.alignment
+        if alignment is None and p.style:
+            curr_style = p.style
+            while curr_style:
+                if curr_style.paragraph_format.alignment is not None:
+                    alignment = curr_style.paragraph_format.alignment
+                    break
+                curr_style = getattr(curr_style, "base_style", None)
+
+        # 2. 大字号兜底：推断标题居中
+        is_large_font = False
+        for run in p.runs:
+            if run.font and run.font.size and getattr(run.font.size, "pt", None):
+                if run.font.size.pt > 20:
+                    is_large_font = True
+                    break
+
+        align_class = ""
+        if alignment == 1 or is_large_font:  # 1 = center
+            align_class = "center"
+        elif alignment == 2:  # 2 = right
+            align_class = "right"
+
+        # 3. 红头横线逻辑（保持兼容）
+        line_style = ""
+        if "编号" in p.text or "签发人" in p.text:
+            line_style = "border-bottom: 2px solid black; padding-bottom: 5px; margin-bottom: 15px;"
+
+        # 4. 汇总 run 样式
+        runs_html = ""
+        for run in p.runs:
+            runs_html += self._convert_run_to_html(run)
+
+        # 5. 计算段落的 inline style（对齐 + 红头线）
+        inline_style = line_style or ""
+        if align_class == "center":
+            inline_style += " text-align: center !important;"
+        elif align_class == "right":
+            inline_style += " text-align: right !important;"
+        inline_style = inline_style.strip()
+
+        return runs_html, align_class, inline_style
+
+    def _convert_run_to_html(self, run):
+        """将单个 run 转为带样式的 <span>/<strong> 结构，支持粗体、斜体、下划线、颜色、字号。"""
+        text = run.text or ""
+        if text == "":
+            return ""
+
+        # 基础字体样式
+        font_css = []
+        if run.font is not None and getattr(run.font, "size", None):
+            try:
+                pt = run.font.size.pt
+                if pt:
+                    font_css.append(f"font-size: {pt * 1.3}px")
+            except Exception:
+                pass
+        if run.font is not None and getattr(run.font, "color", None) and getattr(run.font.color, "rgb", None):
+            font_css.append(f"color: #{run.font.color.rgb}")
+
+        style_str = "; ".join(font_css)
+        content = text.replace(" ", "&nbsp;")  # 保留空格
+
+        # 处理下划线和斜体
+        extra_style = []
+        if getattr(run, "underline", False):
+            extra_style.append("text-decoration: underline;")
+        if getattr(run, "italic", False):
+            extra_style.append("font-style: italic;")
+        if extra_style:
+            if style_str:
+                style_str = style_str + "; " + " ".join(extra_style)
+            else:
+                style_str = " ".join(extra_style)
+
+        inner_html = f'<span style="{style_str}">{content}</span>'
+
+        # 加粗
+        if getattr(run, "bold", False):
+            inner_html = f'<strong style="font-weight: bold;">{inner_html}</strong>'
+
+        return inner_html
+
+    def _convert_table_to_html(self, table):
+        """将 Word 表格转换为 HTML <table> 结构（基础结构 + 粗体表头）。"""
+        rows = table.rows
+        if not rows:
+            return ""
+
+        html_rows = []
+        for r_idx, row in enumerate(rows):
+            cell_htmls = []
+            for cell in row.cells:
+                # 合并所有段落的 HTML
+                cell_text = self._convert_paragraphs_to_html(cell.paragraphs)
+                tag = "th" if r_idx == 0 else "td"
+                cell_htmls.append(f"<{tag}>{cell_text}</{tag}>")
+            html_rows.append("<tr>" + "".join(cell_htmls) + "</tr>")
+
+        return "<table>" + "".join(html_rows) + "</table>"
 
 
     def extract_html_from_pdf(self, file_path: str) -> Optional[str]:

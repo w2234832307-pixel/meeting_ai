@@ -62,8 +62,9 @@ def remove_thinking_tags(text: str) -> str:
     # 移除空的 <p> 标签
     text = re.sub(r'<p>\s*</p>', '', text)
     
-    # 移除开头的无用标签和空白
-    text = re.sub(r'^[\s"<>/\n]*', '', text)
+    # 移除开头的无用标签和空白（保留真正的HTML起始标签，如 <p>）
+    # 同样不删除 '<' 和 '>'，避免破坏正常的 HTML 结构
+    text = re.sub(r'^[\s"\n]*', '', text)
     
     # 移除多余的空白行
     text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
@@ -94,6 +95,16 @@ def add_highlighting(text: str) -> str:
     """
     if not text:
         return text
+
+    # 如果内容本身是合法 JSON（例如说话人摘要 JSON），为避免破坏结构，直接跳过高亮
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            json.loads(stripped)
+            return text
+        except Exception:
+            # 不是纯 JSON，再继续下面的高亮逻辑
+            pass
     
     # === 1. 高亮人名 ===
     # 1.1 带引号的人名：匹配中文引号、英文引号包裹的1-4个字的中文人名

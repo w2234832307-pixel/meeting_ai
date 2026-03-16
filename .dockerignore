@@ -1,0 +1,59 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.eggs
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志和临时文件
+logs/
+*.log
+temp_files/
+*.tmp
+
+# 环境变量（敏感信息）
+.env
+.env.local
+.env.*.local
+
+# 文档
+*.md
+!README.md
+docs/
+
+# 测试
+tests/
+test_*.py
+*_test.py
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# 其他
+.DS_Store
+Thumbs.db
+models/
